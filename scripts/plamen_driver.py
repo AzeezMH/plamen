@@ -8968,6 +8968,43 @@ _SC_DEPTH_CORE_SIDE_JOBS: tuple[dict[str, str], ...] = (
     },
 )
 
+# L1-4: L1 scanner floor, mirrors `_SC_DEPTH_CORE_SIDE_JOBS` role/output names
+# 1:1 (same never-cut group filenames) so the scanner never-cut gate and the
+# depth-promotion feeder globs (`blind_spot_*_findings.md`,
+# `validation_sweep_findings.md`) work identically for both pipelines. The
+# per-role heading each job points to is L1-specific — see
+# `_L1_SCANNER_HEADING_BY_ROLE`.
+_L1_SCANNER_JOBS: tuple[dict[str, str], ...] = (
+    {
+        "agent_id": "blind-spot-a",
+        "role": "blind_spot_a",
+        "output": "blind_spot_a_findings.md",
+        "category": "scanner",
+        "focus": "Scanner: boundary and wire format — codecs, RPC parsing, gossip payloads, proof formats",
+    },
+    {
+        "agent_id": "blind-spot-b",
+        "role": "blind_spot_b",
+        "output": "blind_spot_b_findings.md",
+        "category": "scanner",
+        "focus": "Scanner: state transition and consensus invariant — fork choice, validation, admission",
+    },
+    {
+        "agent_id": "blind-spot-c",
+        "role": "blind_spot_c",
+        "output": "blind_spot_c_findings.md",
+        "category": "scanner",
+        "focus": "Scanner: network amplification and resource exhaustion — P2P/RPC/mempool DoS",
+    },
+    {
+        "agent_id": "validation-sweep",
+        "role": "validation_sweep",
+        "output": "validation_sweep_findings.md",
+        "category": "scanner",
+        "focus": "Scanner: lifecycle, cache, and recovery — expiry, restart/resume, crash recovery",
+    },
+)
+
 _DEPTH_THOROUGH_SIDE_JOBS: tuple[dict[str, str], ...] = (
     {
         "agent_id": "design-stress",
@@ -9540,6 +9577,20 @@ def _depth_worker_jobs(scratchpad: Path, config: dict) -> list[dict[str, str]]:
     jobs: list[dict[str, str]] = []
     if pipeline == "l1":
         jobs.extend(dict(job) for job in _L1_DEPTH_STANDARD_JOBS)
+        if mode in ("core", "thorough"):
+            # L1-4: scanner floor (mirrors SC's blind-spot A/B/C + validation
+            # sweep). Gated Core+ to match where the SC scanner/sweep lane runs.
+            jobs.extend(dict(job) for job in _L1_SCANNER_JOBS)
+            # L1-5: Sibling Propagation is defined for L1 too (see
+            # `## Sibling Propagation Agent` in
+            # prompts/l1/phase4b-scanner-templates.md). Best-effort, additive —
+            # NOT in l1_never_cut_groups; a missing/empty output degrades and
+            # continues (see `_stub_missing_sibling_outputs_on_exhaustion`).
+            seen_sibling = {str(job.get("output", "")) for job in jobs}
+            for sib_job in _sibling_propagation_jobs_if_required(scratchpad, config):
+                if sib_job["output"] not in seen_sibling:
+                    jobs.append(sib_job)
+                    seen_sibling.add(sib_job["output"])
         if mode == "thorough":
             jobs.extend(dict(job) for job in _DEPTH_THOROUGH_SIDE_JOBS)
     else:
@@ -9755,6 +9806,39 @@ def _depth_methodology_path(config: dict) -> Path:
     if str(config.get("pipeline", "sc")) == "l1":
         return plamen_home() / "prompts" / "l1" / "phase4b-depth-driver.md"
     return plamen_home() / "prompts" / "shared" / "v2" / "phase4b-depth.md"
+
+
+def _scanner_template_dir(config: dict) -> str:
+    """Return the `prompts/{dir}/phase4b-scanner-templates.md` directory.
+
+    L1 scanner/sibling methodology lives under `prompts/l1/`, not under a
+    Go/Rust language directory (no `prompts/go/` or `prompts/rust/` tree
+    exists). Every SC language (evm/solana/aptos/sui/soroban/daml) keeps its
+    own `phase4b-scanner-templates.md`, keyed by `config["language"]` as
+    before.
+    """
+    if str(config.get("pipeline", "sc")) == "l1":
+        return "l1"
+    return str(config.get("language", "unknown"))
+
+
+_SC_SCANNER_HEADING_BY_ROLE: dict[str, str] = {
+    "blind_spot_a": "## Blind Spot Scanner A",
+    "blind_spot_b": "## Blind Spot Scanner B",
+    "blind_spot_c": "## Blind Spot Scanner C",
+    "validation_sweep": "## Validation Sweep Agent",
+}
+
+# L1 scanner methodology uses generic `## Scanner: ...` headings (no
+# tokens/guards/inheritance vocabulary — consensus clients have no analog).
+# Order mirrors the SC blind-spot-A/B/C + validation-sweep role slots so the
+# same job scaffolding (`_L1_SCANNER_JOBS` / never-cut groups) applies to both.
+_L1_SCANNER_HEADING_BY_ROLE: dict[str, str] = {
+    "blind_spot_a": "## Scanner: Boundary and Wire Format",
+    "blind_spot_b": "## Scanner: State Transition and Consensus Invariant",
+    "blind_spot_c": "## Scanner: Network Amplification and Resource Exhaustion",
+    "validation_sweep": "## Scanner: Lifecycle, Cache, and Recovery",
+}
 
 
 def _build_depth_worker_prompt(
@@ -9981,9 +10065,39 @@ that the skill file was unavailable in the output.
 Do not spawn subagents. Do not inspect other niche workers' outputs. Do not
 advance to chain analysis, verification, or reporting.
 """
-    elif category == "sibling":
+    elif category == "scanner":
+        scanner_dir = _scanner_template_dir(config)
         scanner_templates = (
-            plamen_home() / "prompts" / language / "phase4b-scanner-templates.md"
+            plamen_home() / "prompts" / scanner_dir / "phase4b-scanner-templates.md"
+        ).as_posix()
+        heading_map = (
+            _L1_SCANNER_HEADING_BY_ROLE if pipeline == "l1"
+            else _SC_SCANNER_HEADING_BY_ROLE
+        )
+        heading = heading_map.get(role, "")
+        heading_line = (
+            f"the `{heading}` section" if heading
+            else "the section matching your assigned role"
+        )
+        standard_block = f"""
+This is a depth-owned scanner worker. Read {heading_line} of
+`{scanner_templates}` and apply ONLY that methodology to the current project —
+do not read or apply any other scanner section in that file. Cross-reference
+`{scratchpad.as_posix()}/findings_inventory.md` (what breadth/depth agents
+already analyzed) so you surface what they missed, not what they already
+covered.
+
+Use finding IDs matching your assigned role's convention (e.g. `[BLIND-A-N]`
+for the "blind_spot_a" role, `[VS-N]` for "validation_sweep") per
+`{finding_format}`.
+
+Do not spawn subagents. Do not inspect or write other workers' outputs. Do not
+advance to chain analysis, verification, or reporting.
+"""
+    elif category == "sibling":
+        scanner_dir = _scanner_template_dir(config)
+        scanner_templates = (
+            plamen_home() / "prompts" / scanner_dir / "phase4b-scanner-templates.md"
         ).as_posix()
         standard_block = f"""
 This is the Sibling Propagation depth worker. Read the
@@ -10460,6 +10574,119 @@ def _read_build_status_flag(scratchpad: Path, flag: str) -> bool | None:
     return m.group(1).lower() in ("true", "yes")
 
 
+def _l1_update_primitive_status_flag(scratchpad: Path, key: str, value: bool) -> None:
+    """Idempotently set a `KEY=true|false` line in primitive_status.md.
+
+    WP-A.3 (L1-only caller): the `bake` phase pre-writes primitive_status.md
+    with `SCIP_GO_REUSED=false` / `SCIP_RUST_REUSED=false` fallback lines
+    (they were declared but never refined). The pre-breadth SCIP bake hook
+    calls this to record the ACTUAL `_bake_go_graph` / `_bake_rust_graph`
+    outcome once it is known. Best-effort and never raises: primitive_status.md
+    is a driver fallback scaffold, so a write failure here must not affect the
+    SCIP bake it merely annotates.
+    """
+    try:
+        path = scratchpad / "primitive_status.md"
+        val = "true" if value else "false"
+        line_re = re.compile(rf"(?m)^{re.escape(key)}\s*=.*$")
+        text = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+        if line_re.search(text):
+            text = line_re.sub(f"{key}={val}", text, count=1)
+        else:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += f"{key}={val}\n"
+        path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _promote_cross_domain_candidates_to_inventory(scratchpad: Path) -> list[str]:
+    """WP-D (L1-3): append CROSS-DOMAIN-DEP candidates as NEEDS_VERIFICATION
+    inventory rows before the verification queue is built.
+
+    Reuses `chain_prep.harvest_cross_domain_candidates` (read-only; auto-
+    covers depth/scanner/sibling outputs via its existing globs — see
+    `_CROSS_DOMAIN_SOURCE_GLOBS`) and the SAME `INV-N` id space
+    `_promote_depth_findings_to_inventory` allocates from (re-derived from
+    the on-disk inventory text AFTER that bridge has already run, and
+    collision-checked against the id ledger), so these rows ride the
+    existing verification_queue extraction path unmodified.
+
+    Low-confidence by construction: every row is stamped
+    `**Verdict**: NEEDS_VERIFICATION` — verify adjudicates each one. This
+    function NEVER emits a CONFIRMED body finding. Best-effort: any failure
+    (missing inventory, harvester error, id-allocation error) degrades to a
+    no-op ([]); it never halts verify_queue.
+    """
+    try:
+        inv = scratchpad / "findings_inventory.md"
+        if not inv.exists():
+            return []
+        import importlib
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        _cp = importlib.import_module("chain_prep")
+        candidates = _cp.harvest_cross_domain_candidates(scratchpad)
+        if not candidates:
+            return []
+        from plamen_validators import _allocate_depth_promotion_inventory_id
+        inv_text = inv.read_text(encoding="utf-8", errors="replace")
+        next_n = max(
+            (int(x) for x in re.findall(r"###\s+Finding\s+\[INV-(\d+)\]", inv_text)),
+            default=0,
+        ) + 1
+        additions = [
+            "",
+            "## Cross-Domain Dependency Candidates (verify-adjudicated)",
+            "",
+            "Mechanically harvested from `[CROSS-DOMAIN-DEP: ...]` depth/scanner "
+            "agent tags -- an admission that a value-bearing assumption lives "
+            "outside that agent's own analysis domain. Each row is a "
+            "LOW-CONFIDENCE candidate only; none of these are CONFIRMED body "
+            "findings -- verification adjudicates every row.",
+            "",
+        ]
+        promoted: list[str] = []
+        for cand in candidates:
+            source_id = str(cand.get("finding_id") or "CROSS-DOMAIN").strip()
+            domain = str(cand.get("domain") or "unspecified").strip()
+            detail = re.sub(r"\s+", " ", str(cand.get("detail") or "")).strip()
+            location = str(cand.get("location") or "unknown").strip()
+            inv_id, next_n = _allocate_depth_promotion_inventory_id(
+                scratchpad,
+                preferred_n=next_n,
+                title=f"Cross-domain dependency ({domain}) from {source_id}",
+            )
+            promoted.append(inv_id)
+            additions.extend([
+                f"### Finding [{inv_id}]: Cross-domain dependency ({domain}) "
+                f"referenced from {source_id}",
+                f"**Source IDs**: [{source_id}]",
+                "**Severity**: Low",
+                f"**Location**: {location}",
+                "**Preferred Tag**: CODE-TRACE",
+                "**Verdict**: NEEDS_VERIFICATION",
+                "",
+                f"**Description**: A depth/scanner agent flagged an assumption "
+                f"outside its own analysis domain ({domain}): {detail[:400]}. "
+                "This is a mechanically-harvested candidate only -- "
+                "verification must adjudicate whether the cross-domain "
+                "dependency, if broken, creates or blocks an exploitable "
+                "precondition elsewhere in scope.",
+                "",
+            ])
+        inv.write_text(
+            inv_text.rstrip() + "\n" + "\n".join(additions), encoding="utf-8"
+        )
+        return promoted
+    except Exception as exc:
+        log.debug(
+            f"[verify_queue] cross-domain candidate promotion skipped: {exc!r}"
+        )
+        return []
+
+
 # Per-ecosystem canonical fuzz worker prompt paths (relative to plamen_home()).
 # Each path is the worker-shaped methodology the fuzz worker reads and executes
 # directly. The driver only decides WHETHER to emit the job (mode + ecosystem +
@@ -10557,12 +10784,13 @@ def _depth_fuzz_jobs_if_required(
 def _sibling_propagation_jobs_if_required(
     scratchpad: Path, config: dict
 ) -> list[dict[str, str]]:
-    """SC-only, best-effort Sibling Propagation depth sidecar job plan.
+    """Best-effort Sibling Propagation depth sidecar job plan (SC + L1).
 
-    The Sibling Propagation Agent is DEFINED in every SC tree's
-    `phase4b-scanner-templates.md` (`## Sibling Propagation Agent`, output
-    `sibling_propagation_findings.md`) but was never spawned by the driver.
-    This rosters it as an ADDITIVE depth worker job.
+    The Sibling Propagation Agent is DEFINED in every SC tree's AND the L1
+    tree's `phase4b-scanner-templates.md` (`## Sibling Propagation Agent`,
+    output `sibling_propagation_findings.md`) but was never spawned by the
+    driver. This rosters it as an ADDITIVE depth worker job for both
+    pipelines.
 
     Best-effort by construction (safety-critical): the output is NOT in
     `sc_never_cut_groups` / `l1_never_cut_groups`, so the never-cut gate cannot
@@ -10572,11 +10800,8 @@ def _sibling_propagation_jobs_if_required(
     degrades and continues; it never halts the depth phase.
 
     Gating (matches where the SC scanner/validation secondaries run):
-      - pipeline == 'l1'            -> [] (no SC scanner-template section)
       - mode not in core/thorough   -> [] (Light skips the re-scan/scanner lane)
     """
-    if str(config.get("pipeline", "sc")).lower() == "l1":
-        return []
     if str(config.get("mode", "core")).lower() not in ("core", "thorough"):
         return []
     return [{
@@ -10597,25 +10822,50 @@ def _stub_missing_sibling_outputs_on_exhaustion(
     phase: Phase,
     jobs: list[dict[str, str]],
 ) -> bool:
-    """Write a degrade-continue stub for any incomplete sibling job after retries.
+    """Write a degrade-continue stub for any incomplete sibling/scanner job.
 
-    Mirrors `_stub_missing_fuzz_outputs_on_exhaustion`. Sibling propagation is
-    additive and non-blocking; a worker that crashed before writing its output
-    must not be allowed to halt depth. Writes a minimal `## No Findings`
-    artifact (with the COMPLETE marker) for each still-incomplete
-    category=='sibling' job. Returns True when at least one stub was written.
-    Standard/scanner/sidecar/niche/fuzz jobs are untouched.
+    Mirrors `_stub_missing_fuzz_outputs_on_exhaustion`. Sibling propagation and
+    scanner (blind-spot/validation-sweep) jobs are additive/never-cut-floor
+    jobs, not exit-early-if-crashed jobs — a worker that crashed before
+    writing its output must not be allowed to halt depth. Writes a minimal
+    `## No Findings` artifact (with the COMPLETE marker) for each still-
+    incomplete `category in ('sibling', 'scanner')` job. Returns True when at
+    least one stub was written. Standard/sidecar/niche/fuzz jobs are
+    untouched.
+
+    Note: for L1/SC scanner jobs this stub SATISFIES the never-cut gate (a
+    file must exist, stub or not) — it converts a crashed-worker halt into a
+    degrade-continue with an empty, honestly-labeled artifact.
     """
     wrote = False
     for job in jobs:
-        if job.get("category") != "sibling":
+        category = job.get("category")
+        if category not in ("sibling", "scanner"):
             continue
         if _depth_worker_output_complete(scratchpad, phase, job):
             continue
         output = str(job["output"])
-        agent_id = str(job.get("agent_id", "sibling-propagation"))
+        default_agent = "sibling-propagation" if category == "sibling" else "scanner"
+        agent_id = str(job.get("agent_id", default_agent))
         path = scratchpad / output
-        reason = "sibling-propagation worker produced no output after all retry attempts"
+        if category == "sibling":
+            title = f"Sibling Propagation Findings ({agent_id})"
+            reason = "sibling-propagation worker produced no output after all retry attempts"
+            note = (
+                "The sibling-propagation pass did not execute, so no sibling "
+                "findings were produced. This is a non-blocking degrade-continue "
+                "artifact: sibling propagation is additive only and never gates "
+                "the depth phase."
+            )
+        else:
+            title = f"Scanner Findings ({agent_id})"
+            reason = f"scanner worker {agent_id} produced no output after all retry attempts"
+            note = (
+                "The scanner pass did not execute, so no scanner findings were "
+                "produced. This is a non-blocking degrade-continue artifact: it "
+                "satisfies the scanner never-cut floor without fabricating "
+                "analysis; a crashed scanner worker never halts the depth phase."
+            )
         body = (
             f"<!-- PLAMEN_ARTIFACT: {output} -->\n"
             f"<!-- PLAMEN_OWNER: {agent_id} -->\n"
@@ -10624,27 +10874,24 @@ def _stub_missing_sibling_outputs_on_exhaustion(
             f"<!-- PLAMEN_VERSION: 1 -->\n"
             f"<!-- AGENT_ROW: {agent_id} -->\n"
             f"<!-- EXPECTED_OUTPUT: {output} -->\n\n"
-            f"# Sibling Propagation Findings ({agent_id})\n\n"
+            f"# {title}\n\n"
             f"## No Findings\n"
             f"Reason: {reason}.\n\n"
-            f"The sibling-propagation pass did not execute, so no sibling "
-            f"findings were produced. This is a non-blocking degrade-continue "
-            f"artifact: sibling propagation is additive only and never gates "
-            f"the depth phase.\n\n"
+            f"{note}\n\n"
             f"<!-- PLAMEN_STATUS: COMPLETE -->\n"
         )
         try:
             path.write_text(body, encoding="utf-8")
             wrote = True
             log.warning(
-                "[depth] sibling-propagation job %s exhausted retries — wrote "
-                "degrade-continue stub (%s)",
-                agent_id, output,
+                "[depth] %s job %s exhausted retries — wrote degrade-continue "
+                "stub (%s)",
+                category, agent_id, output,
             )
         except OSError as exc:
             log.warning(
-                "[depth] could not write sibling degrade stub %s: %s",
-                output, exc,
+                "[depth] could not write %s degrade stub %s: %s",
+                category, output, exc,
             )
     return wrote
 
@@ -10857,8 +11104,10 @@ def _run_depth_worker_pool_pty(
     # artifact and re-check. Scoped to category=='fuzz' ONLY — standard depth
     # jobs keep their strict completion.
     stubbed_any = _stub_missing_fuzz_outputs_on_exhaustion(scratchpad, phase, jobs)
-    # Same class as fuzz: sibling propagation is additive/non-blocking. Stub any
-    # still-missing sibling output so a crashed sibling worker cannot halt depth.
+    # Same class as fuzz: sibling propagation is additive/non-blocking, and
+    # scanner jobs (never-cut FLOOR, not exit-on-crash) still must not hang
+    # the pool forever on a crashed worker. Stub any still-missing
+    # sibling/scanner output so a crashed worker cannot halt depth.
     if _stub_missing_sibling_outputs_on_exhaustion(scratchpad, phase, jobs):
         stubbed_any = True
     if stubbed_any:
@@ -12246,6 +12495,22 @@ def run_phase(phase: Phase, config: dict, attempt: int) -> int:
                 from recon_prepass import _bake_go_graph
                 status = _bake_go_graph(scratchpad, _proj)
                 log.info(f"[{phase.name}] Go graph pre-breadth bake: {status}")
+                # WP-A.3: primitive_status.md pre-declares SCIP_GO_REUSED=false
+                # (bake-phase fallback) but nothing ever refined it. The bake
+                # contract returns REUSED:.../WRITTEN:.../FAILED:...; only a
+                # REUSED/WRITTEN outcome is a real signal to record.
+                try:
+                    _status_u = str(status).upper()
+                    if _status_u.startswith("REUSED"):
+                        _l1_update_primitive_status_flag(
+                            scratchpad, "SCIP_GO_REUSED", True
+                        )
+                    elif _status_u.startswith("WRITTEN"):
+                        _l1_update_primitive_status_flag(
+                            scratchpad, "SCIP_GO_REUSED", False
+                        )
+                except Exception:
+                    pass
             if (
                 config.get("pipeline") == "l1"
                 and _lang in ("rust", "mixed")
@@ -12259,6 +12524,20 @@ def run_phase(phase: Phase, config: dict, attempt: int) -> int:
                 from recon_prepass import _bake_rust_graph
                 status = _bake_rust_graph(scratchpad, _proj)
                 log.info(f"[{phase.name}] Rust graph pre-breadth bake: {status}")
+                # WP-A.3: same primitive_status.md refinement as the Go bake
+                # above, scoped to the L1 rust bake outcome only.
+                try:
+                    _status_u = str(status).upper()
+                    if _status_u.startswith("REUSED"):
+                        _l1_update_primitive_status_flag(
+                            scratchpad, "SCIP_RUST_REUSED", True
+                        )
+                    elif _status_u.startswith("WRITTEN"):
+                        _l1_update_primitive_status_flag(
+                            scratchpad, "SCIP_RUST_REUSED", False
+                        )
+                except Exception:
+                    pass
             if (
                 config.get("pipeline") != "l1"
                 and _lang == "solana"
@@ -18044,6 +18323,20 @@ def main():
             if promoted:
                 log.info(
                     f"[verify_queue] promoted {len(promoted)} depth finding(s) "
+                    "into findings_inventory.md before queue generation"
+                )
+            # L1-3 (WP-D): mechanically append verify-adjudicated
+            # NEEDS_VERIFICATION rows for CROSS-DOMAIN-DEP candidates the
+            # depth/scanner/sibling agents flagged. Low-confidence by
+            # construction; never a CONFIRMED body finding. Runs AFTER the
+            # depth-promotion bridge above so it rides the SAME INV-N id space.
+            cross_domain_promoted = _promote_cross_domain_candidates_to_inventory(
+                scratchpad
+            )
+            if cross_domain_promoted:
+                log.info(
+                    f"[verify_queue] promoted {len(cross_domain_promoted)} "
+                    "cross-domain dependency candidate(s) (NEEDS_VERIFICATION) "
                     "into findings_inventory.md before queue generation"
                 )
             _dedup_cap = _dedup_live_pair_cap()

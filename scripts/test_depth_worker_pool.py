@@ -357,3 +357,145 @@ def test_depth_worker_input_snapshot_restores_prior_phase_artifact(tmp_path: Pat
 
     assert restored == ["analysis_percontract_3.md"]
     assert prior.read_text(encoding="utf-8") == "original prior-phase analysis\n"
+
+
+# ---------------------------------------------------------------------------
+# L1-4 / L1-5 — L1 scanner floor + sibling propagation job dispatch
+# ---------------------------------------------------------------------------
+
+_L1_SCANNER_OUTPUTS = (
+    "blind_spot_a_findings.md",
+    "blind_spot_b_findings.md",
+    "blind_spot_c_findings.md",
+    "validation_sweep_findings.md",
+)
+
+
+def test_depth_worker_jobs_l1_core_includes_scanner_and_sibling(tmp_path: Path):
+    sp = tmp_path / ".scratchpad"
+    _fresh(sp)
+    jobs = D._depth_worker_jobs(sp, {"pipeline": "l1", "mode": "core"})
+    outputs = {job["output"] for job in jobs}
+    for name in (*_L1_SCANNER_OUTPUTS, "sibling_propagation_findings.md"):
+        assert name in outputs, f"missing {name} in L1 core jobs: {outputs}"
+    by_output = {job["output"]: job for job in jobs}
+    for name in _L1_SCANNER_OUTPUTS:
+        assert by_output[name]["category"] == "scanner"
+    assert by_output["sibling_propagation_findings.md"]["category"] == "sibling"
+
+
+def test_depth_worker_jobs_l1_thorough_includes_scanner_and_sibling(tmp_path: Path):
+    sp = tmp_path / ".scratchpad"
+    _fresh(sp)
+    jobs = D._depth_worker_jobs(sp, {"pipeline": "l1", "mode": "thorough"})
+    outputs = {job["output"] for job in jobs}
+    for name in (
+        *_L1_SCANNER_OUTPUTS,
+        "sibling_propagation_findings.md",
+        "design_stress_findings.md",
+    ):
+        assert name in outputs, f"missing {name} in L1 thorough jobs: {outputs}"
+
+
+def test_depth_worker_jobs_l1_light_excludes_scanner_and_sibling(tmp_path: Path):
+    sp = tmp_path / ".scratchpad"
+    _fresh(sp)
+    jobs = D._depth_worker_jobs(sp, {"pipeline": "l1", "mode": "light"})
+    outputs = {job["output"] for job in jobs}
+    for name in (*_L1_SCANNER_OUTPUTS, "sibling_propagation_findings.md"):
+        assert name not in outputs, f"unexpected {name} in L1 light jobs: {outputs}"
+
+
+def test_depth_worker_prompt_scanner_points_to_l1_heading(tmp_path: Path):
+    sp = tmp_path / ".scratchpad"
+    _fresh(sp)
+    jobs = D._depth_worker_jobs(sp, {"pipeline": "l1", "mode": "core"})
+    job = next(j for j in jobs if j["output"] == "blind_spot_a_findings.md")
+
+    prompt = D._build_depth_worker_prompt(
+        job=job,
+        scratchpad=sp,
+        project_root=str(tmp_path),
+        config={"language": "go", "mode": "core", "pipeline": "l1"},
+        attempt=1,
+    )
+
+    assert "## Scanner: Boundary and Wire Format" in prompt
+    assert "prompts/l1/phase4b-scanner-templates.md" in prompt.replace("\\", "/")
+    assert "EXPECTED_OUTPUT: blind_spot_a_findings.md" in prompt
+
+
+def test_depth_worker_prompt_scanner_points_to_sc_heading(tmp_path: Path):
+    sp = tmp_path / ".scratchpad"
+    _fresh(sp)
+    jobs = D._depth_worker_jobs(sp, {"pipeline": "sc", "mode": "core"})
+    job = next(j for j in jobs if j["output"] == "blind_spot_a_findings.md")
+
+    prompt = D._build_depth_worker_prompt(
+        job=job,
+        scratchpad=sp,
+        project_root=str(tmp_path),
+        config={"language": "evm", "mode": "core", "pipeline": "sc"},
+        attempt=1,
+    )
+
+    assert "## Blind Spot Scanner A" in prompt
+    assert "prompts/evm/phase4b-scanner-templates.md" in prompt.replace("\\", "/")
+
+
+def test_l1_never_cut_scanner_group_gate(tmp_path: Path):
+    """A missing scanner artifact FAILS the L1 Core never-cut gate; writing
+    all 4 makes it PASS (mirrors the SC blind-spot/validation-sweep floor)."""
+    sp = tmp_path / ".scratchpad"
+    sp.mkdir(parents=True, exist_ok=True)
+    base_files = (
+        "depth_consensus_invariant_findings.md",
+        "depth_network_surface_findings.md",
+        "depth_state_trace_findings.md",
+        "depth_external_findings.md",
+        "depth_edge_case_findings.md",
+        "confidence_scores.md",
+    )
+    for f in base_files:
+        (sp / f).write_text("# Findings\n\nSome content here.\n", encoding="utf-8")
+
+    missing = D._assert_never_cut_artifacts(sp, D.l1_never_cut_groups("core"))
+    assert any("blind_spot_a_findings.md" in m for m in missing), missing
+    assert any("validation_sweep_findings.md" in m for m in missing), missing
+
+    for f in _L1_SCANNER_OUTPUTS:
+        (sp / f).write_text("# Findings\n\nSome content here.\n", encoding="utf-8")
+
+    missing_after = D._assert_never_cut_artifacts(sp, D.l1_never_cut_groups("core"))
+    assert missing_after == [], missing_after
+
+
+def test_scanner_finding_promotes_to_inventory(tmp_path: Path):
+    """A synthetic blind_spot_a_findings.md [BLIND-A-1] block ACTUALLY lands
+    in findings_inventory.md via `_promote_depth_findings_to_inventory`."""
+    sp = tmp_path / ".scratchpad"
+    _fresh(sp)
+    (sp / "blind_spot_a_findings.md").write_text(
+        "<!-- PLAMEN_ARTIFACT: blind_spot_a_findings.md -->\n"
+        "<!-- PLAMEN_OWNER: blind-spot-a -->\n"
+        "<!-- PLAMEN_STATUS: IN_PROGRESS -->\n"
+        "<!-- PLAMEN_PHASE: depth -->\n"
+        "<!-- PLAMEN_VERSION: 1 -->\n"
+        "<!-- AGENT_ROW: blind-spot-a -->\n"
+        "<!-- EXPECTED_OUTPUT: blind_spot_a_findings.md -->\n\n"
+        "### Finding [BLIND-A-1]: Missing length check before allocation\n"
+        "**Verdict**: CONFIRMED\n"
+        "**Severity**: High\n"
+        "**Location**: p2p/codec.go:L120\n"
+        "**Preferred Tag**: CODE-TRACE\n\n"
+        "**Description**: " + ("Detailed trace evidence. " * 20) + "\n\n"
+        "<!-- PLAMEN_STATUS: COMPLETE -->\n",
+        encoding="utf-8",
+    )
+
+    promoted = D._promote_depth_findings_to_inventory(sp)
+
+    assert "BLIND-A-1" in promoted, promoted
+    inv_text = (sp / "findings_inventory.md").read_text(encoding="utf-8")
+    assert "BLIND-A-1" in inv_text
+    assert "### Finding [INV-" in inv_text

@@ -53,7 +53,12 @@ Check:
 - Partial writes treated as committed on restart.
 - Recovery paths skipping validation performed on the normal path.
 
-## Scanner: Sibling Propagation
+## Sibling Propagation Agent
+
+**FIRST ACTION**: Use the Write tool to create
+`{SCRATCHPAD}/sibling_propagation_findings.md` with a one-line header
+`# Sibling Propagation Findings`. This reserves your write budget so the file
+exists on disk even if your analysis is interrupted.
 
 After finding one bug class, scan sibling entry points with the same fix pattern.
 Keep siblings separate only when the fix or exploit precondition differs.

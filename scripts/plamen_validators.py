@@ -153,6 +153,7 @@ __all__ = [
     "_parse_subsystem_coverage_gap",
     "_primitive_sweep_relevant",
     "_promote_depth_findings_to_inventory",
+    "_allocate_depth_promotion_inventory_id",
     "_quarantine_foreign_phase_writes",
     "_quarantine_phase_overreach",
     "_quarantine_report_without_completed_assemble",

@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import sys
 import textwrap
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from recon_prepass import (
     _bake_rust_scip,
     _bake_go_scip,
+    _bake_rust_graph,
+    _bake_go_graph,
     _scip_to_graph_artifacts,
     run_recon_prepass,
 )
@@ -549,3 +552,218 @@ def test_scip_to_graph_large_index_partial_no_nameerror(tmp_path):
         result = _scip_to_graph_artifacts(scratch, index, proj)
     assert result.startswith("WRITTEN:"), result
     assert "PARTIAL" in (scratch / "callee_map.md").read_text(encoding="utf-8")
+
+
+# ── L1-8: SCIP bake freshness/reuse guard ─────────────────────────────────
+#
+# _bake_rust_scip/_bake_go_scip previously re-ran the (180s/600s) external
+# indexer unconditionally, even when a fresh index + graph artifacts already
+# existed on disk -- baking the index TWICE per L1 Go/Rust audit run (Path A
+# pre-breadth hook + Path B bake phase both invoke the shared baker). These
+# tests prove the freshness guard added in recon_prepass.py short-circuits
+# the (mocked) subprocess call when the on-disk artifacts are fresh, and
+# still rebuilds when a source file is newer than the index.
+
+_ALL_GRAPH_ARTIFACTS = ("caller_map.md", "callee_map.md", "state_write_map.md", "function_summary.md")
+
+
+def _touch(p: Path, mtime: float) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        p.write_text("stub", encoding="utf-8")
+    os.utime(p, (mtime, mtime))
+
+
+def test_rust_freshness_guard_reuses_when_fresh(tmp_path):
+    """Index + all 4 graph artifacts already exist and are newer than every
+    .rs source -> _bake_rust_scip returns REUSED WITHOUT invoking the
+    rust-analyzer subprocess."""
+    scratch = _mkscratch(tmp_path)
+    proj = _mkproj(tmp_path)
+    src = proj / "lib.rs"
+    src.write_text("pub fn f() {}\n", encoding="utf-8")
+
+    now = time.time()
+    os.utime(src, (now - 100, now - 100))
+    index = scratch / "scip_rust.index"
+    _touch(index, now)
+    for name in _ALL_GRAPH_ARTIFACTS:
+        _touch(scratch / name, now)
+
+    with mock.patch("shutil.which", return_value="/usr/bin/rust-analyzer"), \
+         mock.patch("recon_prepass._run_hardened") as m_run:
+        result = _bake_rust_scip(scratch, proj)
+
+    assert result == "REUSED"
+    m_run.assert_not_called()
+
+
+def test_rust_freshness_guard_rebuilds_when_stale(tmp_path):
+    """A .rs source newer than the existing index -> the guard does NOT
+    short-circuit; the indexer subprocess IS invoked (normal rebuild path)."""
+    scratch = _mkscratch(tmp_path)
+    proj = _mkproj(tmp_path)
+    src = proj / "lib.rs"
+    src.write_text("pub fn f() {}\n", encoding="utf-8")
+
+    now = time.time()
+    index = scratch / "scip_rust.index"
+    _touch(index, now - 100)
+    for name in _ALL_GRAPH_ARTIFACTS:
+        _touch(scratch / name, now - 100)
+    os.utime(src, (now, now))  # source is NEWER than the index -> stale
+
+    with mock.patch("shutil.which", return_value="/usr/bin/rust-analyzer"), \
+         mock.patch("recon_prepass._run_hardened", return_value=(0, "")) as m_run:
+        result = _bake_rust_scip(scratch, proj)
+
+    m_run.assert_called_once()
+    # Rebuild path proceeds past the guard; it fails later only because the
+    # mocked subprocess never produced a real index.scip -- that failure
+    # proves the guard let the rebuild through, which is what this test checks.
+    assert result.startswith("FAILED:")
+    assert "not produced" in result
+
+
+def test_rust_freshness_guard_rebuilds_when_artifact_missing(tmp_path):
+    """Index is fresh but one of the 4 graph artifacts is missing -> the
+    guard does NOT reuse (all 4 artifacts are required)."""
+    scratch = _mkscratch(tmp_path)
+    proj = _mkproj(tmp_path)
+    src = proj / "lib.rs"
+    src.write_text("pub fn f() {}\n", encoding="utf-8")
+
+    now = time.time()
+    os.utime(src, (now - 100, now - 100))
+    index = scratch / "scip_rust.index"
+    _touch(index, now)
+    # Only write 3 of the 4 required artifacts -- function_summary.md missing.
+    for name in _ALL_GRAPH_ARTIFACTS[:3]:
+        _touch(scratch / name, now)
+
+    with mock.patch("shutil.which", return_value="/usr/bin/rust-analyzer"), \
+         mock.patch("recon_prepass._run_hardened", return_value=(0, "")) as m_run:
+        result = _bake_rust_scip(scratch, proj)
+
+    m_run.assert_called_once()
+    assert result != "REUSED"
+
+
+def test_go_freshness_guard_reuses_when_fresh(tmp_path):
+    """Go mirror of test_rust_freshness_guard_reuses_when_fresh."""
+    scratch = _mkscratch(tmp_path)
+    proj = _mkproj_go(tmp_path)
+    src = proj / "main.go"
+    src.write_text("package main\nfunc f() {}\n", encoding="utf-8")
+
+    now = time.time()
+    os.utime(src, (now - 100, now - 100))
+    index = scratch / "scip_go.index"
+    _touch(index, now)
+    for name in _ALL_GRAPH_ARTIFACTS:
+        _touch(scratch / name, now)
+
+    with mock.patch("shutil.which", return_value="/usr/bin/scip-go"), \
+         mock.patch("recon_prepass._run_hardened") as m_run:
+        result = _bake_go_scip(scratch, proj)
+
+    assert result == "REUSED"
+    m_run.assert_not_called()
+
+
+def test_go_freshness_guard_rebuilds_when_stale(tmp_path):
+    """Go mirror of test_rust_freshness_guard_rebuilds_when_stale."""
+    scratch = _mkscratch(tmp_path)
+    proj = _mkproj_go(tmp_path)
+    src = proj / "main.go"
+    src.write_text("package main\nfunc f() {}\n", encoding="utf-8")
+
+    now = time.time()
+    index = scratch / "scip_go.index"
+    _touch(index, now - 100)
+    for name in _ALL_GRAPH_ARTIFACTS:
+        _touch(scratch / name, now - 100)
+    os.utime(src, (now, now))  # source is NEWER than the index -> stale
+
+    with mock.patch("shutil.which", return_value="/usr/bin/scip-go"), \
+         mock.patch("recon_prepass._run_hardened", return_value=(0, "")) as m_run:
+        result = _bake_go_scip(scratch, proj)
+
+    m_run.assert_called_once()
+    assert result.startswith("FAILED:")
+    assert "not produced" in result
+
+
+def test_bake_rust_graph_idempotent_second_call_reuses(tmp_path):
+    """SHARED-CODE regression: `_bake_rust_scip` is shared by the L1 Go/Rust
+    lane AND the SC Solana/Soroban lane (both call it via `_bake_rust_graph`).
+    Calling the tiered wrapper TWICE against the same workspace must NOT
+    re-invoke the rust-analyzer subprocess on the second call -- proving the
+    freshness guard benefits every caller of the shared baker, not just L1."""
+    scratch = _mkscratch(tmp_path)
+    proj = _mkproj(tmp_path)
+    src = proj / "lib.rs"
+    src.write_text("pub fn f() {}\n", encoding="utf-8")
+    now = time.time()
+    os.utime(src, (now - 100, now - 100))
+
+    fake_index = proj / "index.scip"
+    fake_index.write_bytes(b"x" * 500)
+
+    import types
+    fake_plamen_l1 = types.ModuleType("plamen_l1")
+    fake_scip_mod = types.ModuleType("plamen_l1.scip_reader")
+    fake_scip_mod.ScipReader = _FakeScipReader
+    fake_plamen_l1.scip_reader = fake_scip_mod
+
+    with mock.patch("shutil.which", return_value="/usr/bin/rust-analyzer"), \
+         mock.patch("recon_prepass._run_hardened", return_value=(0, "")) as m_run, \
+         mock.patch.dict("sys.modules", {
+             "plamen_l1": fake_plamen_l1,
+             "plamen_l1.scip_reader": fake_scip_mod,
+         }):
+        first = _bake_rust_graph(scratch, proj)
+        assert "WRITTEN" in first, first
+        assert m_run.call_count == 1
+
+        second = _bake_rust_graph(scratch, proj)
+        assert second == "REUSED:scip"
+        assert m_run.call_count == 1  # not called again -- idempotent no-op
+
+
+def test_bake_go_graph_idempotent_second_call_reuses(tmp_path):
+    """Go mirror of test_bake_rust_graph_idempotent_second_call_reuses."""
+    scratch = _mkscratch(tmp_path)
+    proj = _mkproj_go(tmp_path)
+    src = proj / "main.go"
+    src.write_text("package main\nfunc f() {}\n", encoding="utf-8")
+    now = time.time()
+    os.utime(src, (now - 100, now - 100))
+
+    fake_index = proj / "_plamen_scip_go.index"
+
+    import types
+    fake_plamen_l1 = types.ModuleType("plamen_l1")
+    fake_scip_mod = types.ModuleType("plamen_l1.scip_reader")
+    fake_scip_mod.ScipReader = _FakeScipReader
+    fake_plamen_l1.scip_reader = fake_scip_mod
+
+    def _fake_run_hardened(cmd, cwd, timeout):
+        # Mirrors what the real `scip-go` subprocess would do: write the
+        # pinned output index file scip-go was invoked with `--output` for.
+        fake_index.write_bytes(b"x" * 500)
+        return (0, "")
+
+    with mock.patch("shutil.which", return_value="/usr/bin/scip-go"), \
+         mock.patch("recon_prepass._run_hardened", side_effect=_fake_run_hardened) as m_run, \
+         mock.patch.dict("sys.modules", {
+             "plamen_l1": fake_plamen_l1,
+             "plamen_l1.scip_reader": fake_scip_mod,
+         }):
+        first = _bake_go_graph(scratch, proj)
+        assert "WRITTEN" in first, first
+        assert m_run.call_count == 1
+
+        second = _bake_go_graph(scratch, proj)
+        assert second == "REUSED:scip"
+        assert m_run.call_count == 1  # not called again -- idempotent no-op

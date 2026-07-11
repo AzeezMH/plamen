@@ -457,6 +457,12 @@ L1_NEVER_CUT_ARTIFACT_GROUPS = [
     ["depth_state_trace_findings.md"],
     ["depth_external_findings.md"],
     ["depth_edge_case_findings.md"],
+    # L1-4: scanner floor (kept in sync with L1_NEVER_CUT_CORE_EXTRAS below so
+    # this legacy flat default still mirrors the full mode-aware thorough set).
+    ["blind_spot_a_findings.md"],
+    ["blind_spot_b_findings.md"],
+    ["blind_spot_c_findings.md"],
+    ["validation_sweep_findings.md", "scanner_validation_findings.md"],
     ["design_stress_findings.md", "depth_design_stress_findings.md"],
     ["perturbation_findings.md", "depth_perturbation_findings.md"],
     ["confidence_scores.md"],
@@ -475,6 +481,13 @@ L1_NEVER_CUT_BASE = [
     ["depth_edge_case_findings.md"],
 ]
 L1_NEVER_CUT_CORE_EXTRAS = [
+    # L1-4: scanner floor, mirrors SC_NEVER_CUT_CORE_EXTRAS exactly (same
+    # canonical filenames — the depth-promotion feeder globs and the scanner
+    # never-cut gate are pipeline-agnostic by construction).
+    ["blind_spot_a_findings.md"],
+    ["blind_spot_b_findings.md"],
+    ["blind_spot_c_findings.md"],
+    ["validation_sweep_findings.md", "scanner_validation_findings.md"],
     ["confidence_scores.md"],
 ]
 L1_NEVER_CUT_THOROUGH_EXTRAS = [

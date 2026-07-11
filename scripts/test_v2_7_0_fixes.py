@@ -1193,15 +1193,18 @@ class TestL1NeverCutModeAwareness:
         assert "depth_external_findings.md" in flat
         assert "depth_edge_case_findings.md" in flat
 
-    def test_core_mode_has_6_groups(self):
+    def test_core_mode_has_10_groups(self):
         from plamen_types import l1_never_cut_groups
+        # L1-4: 5 depth + 4 scanner (blind-spot A/B/C + validation sweep) +
+        # confidence_scores.
         groups = l1_never_cut_groups("core")
-        assert len(groups) == 6  # 5 depth + confidence_scores
+        assert len(groups) == 10
 
-    def test_thorough_mode_has_9_groups(self):
+    def test_thorough_mode_has_13_groups(self):
         from plamen_types import l1_never_cut_groups
+        # 5 depth + 4 scanner + confidence + 3 thorough extras.
         groups = l1_never_cut_groups("thorough")
-        assert len(groups) == 9  # 5 depth + confidence + 3 thorough extras
+        assert len(groups) == 13
 
     def test_sc_pattern_parity(self):
         """L1 now mirrors SC's 3-tier architecture."""

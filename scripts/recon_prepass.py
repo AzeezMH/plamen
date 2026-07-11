@@ -1943,13 +1943,52 @@ _RUST_ANALYZER_SCIP_TIMEOUT = 180  # seconds
 # budget; on timeout the caller falls back to grep (non-fatal).
 _SCIP_GO_TIMEOUT = 600  # seconds
 
+_SCIP_GRAPH_ARTIFACT_NAMES = (
+    "caller_map.md", "callee_map.md", "state_write_map.md", "function_summary.md",
+)
+
+
+def _scip_bake_is_fresh(scratch: Path, proj: Path, index_path: Path,
+                        suffixes: Tuple[str, ...]) -> bool:
+    """L1-8: freshness/reuse guard shared by the Rust and Go SCIP bakers.
+
+    True when a previously-baked SCIP index AND all 4 graph artifacts already
+    exist on disk and are at least as new as every in-scope production source
+    file. Lets a caller skip the (180s-600s) indexer subprocess entirely when
+    nothing changed since the last bake — collapsing the double-bake this
+    guards against (Path A pre-breadth hook + Path B bake phase both invoking
+    the same baker in one audit run). Bounded scan via `_production_source_files`
+    (skips vendor/mock/test/lib dirs) keeps this cheap even on large repos.
+
+    Never raises: any stat()/scan error is treated as "not fresh" so the caller
+    falls through to a normal rebuild.
+    """
+    try:
+        if not index_path.exists():
+            return False
+        for name in _SCIP_GRAPH_ARTIFACT_NAMES:
+            art = scratch / name
+            if not art.exists() or art.stat().st_size == 0:
+                return False
+        index_mtime = index_path.stat().st_mtime
+        for f in _production_source_files(proj, suffixes):
+            try:
+                if f.stat().st_mtime > index_mtime:
+                    return False
+            except OSError:
+                continue
+        return True
+    except Exception:
+        return False
+
+
 def _bake_rust_scip(scratch: Path, proj: Path) -> str:
     """Run `rust-analyzer scip` on a Rust project and generate graph artifacts.
 
     Produces caller_map.md, callee_map.md, state_write_map.md, function_summary.md
     from the SCIP index — the same artifacts depth agents expect.
 
-    Returns status string: WRITTEN | SKIPPED | FAILED:{reason}
+    Returns status string: WRITTEN | REUSED | SKIPPED | FAILED:{reason}
     """
     if not shutil.which("rust-analyzer"):
         return "SKIPPED:rust-analyzer not found"
@@ -1959,6 +1998,13 @@ def _bake_rust_scip(scratch: Path, proj: Path) -> str:
         return "SKIPPED:no Cargo.toml"
 
     index_path = scratch / "scip_rust.index"
+
+    # L1-8: reuse a fresh prior bake instead of re-running the 180s indexer.
+    try:
+        if _scip_bake_is_fresh(scratch, proj, index_path, (".rs",)):
+            return "REUSED"
+    except Exception:
+        pass
 
     # Run rust-analyzer scip (hang-proof: temp-file drain + tree-kill — a
     # rust-analyzer worker grandchild can no longer deadlock the parent).
@@ -1993,7 +2039,7 @@ def _bake_go_scip(scratch: Path, proj: Path) -> str:
     artifacts depth agents expect. SCIP is a language-agnostic protobuf, so
     ``_scip_to_graph_artifacts`` parses a Go index identically to a Rust one.
 
-    Returns status string: WRITTEN | SKIPPED | FAILED:{reason}
+    Returns status string: WRITTEN | REUSED | SKIPPED | FAILED:{reason}
     """
     if not shutil.which("scip-go"):
         return "SKIPPED:scip-go not found"
@@ -2005,6 +2051,14 @@ def _bake_go_scip(scratch: Path, proj: Path) -> str:
         return "SKIPPED:no go.mod"
 
     index_path = scratch / "scip_go.index"
+
+    # L1-8: reuse a fresh prior bake instead of re-running the 600s indexer.
+    try:
+        if _scip_bake_is_fresh(scratch, proj, index_path, (".go",)):
+            return "REUSED"
+    except Exception:
+        pass
+
     # scip-go writes the output (default index.scip) into its working dir; pin it
     # explicitly so we never collide with a checked-in index.scip in the repo.
     ra_index = proj / "_plamen_scip_go.index"
@@ -2549,8 +2603,14 @@ def _bake_go_source_graph(scratch: Path, proj: Path) -> str:
 def _bake_rust_graph(scratch: Path, proj: Path) -> str:
     """Tiered Rust graph (never mock): precise SCIP when the toolchain is present
     and the index builds, else the compilation-free source parse so the
-    enumeration gate still has a graph. Mirrors `_bake_evm_graph`."""
+    enumeration gate still has a graph. Mirrors `_bake_evm_graph`.
+
+    Return contract (callers may see any of): REUSED:scip | WRITTEN:scip |
+    WRITTEN:rust-source (scip {status}) | FAILED:scip={status}; source={status}
+    """
     scip = _bake_rust_scip(scratch, proj)
+    if scip == "REUSED":
+        return "REUSED:scip"
     if scip == "WRITTEN":
         return "WRITTEN:scip"
     src = _bake_rust_source_graph(scratch, proj)
@@ -2560,8 +2620,14 @@ def _bake_rust_graph(scratch: Path, proj: Path) -> str:
 
 def _bake_go_graph(scratch: Path, proj: Path) -> str:
     """Tiered Go graph (never mock): precise SCIP when scip-go is present and the
-    index builds, else the compilation-free source parse."""
+    index builds, else the compilation-free source parse.
+
+    Return contract (callers may see any of): REUSED:scip | WRITTEN:scip |
+    WRITTEN:go-source (scip {status}) | FAILED:scip={status}; source={status}
+    """
     scip = _bake_go_scip(scratch, proj)
+    if scip == "REUSED":
+        return "REUSED:scip"
     if scip == "WRITTEN":
         return "WRITTEN:scip"
     src = _bake_go_source_graph(scratch, proj)

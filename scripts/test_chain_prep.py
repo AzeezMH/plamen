@@ -482,3 +482,91 @@ def test_enabler_baseline_writes_cross_domain_table(tmp_path):
     assert "Cross-Domain Dependency Enablers" in text
     assert "destination VM deserialization scheme" in text
     assert "DX-1" in text
+
+
+# ---------------------------------------------------------------------------
+# WP-D (L1-3) — public harvest_cross_domain_candidates wrapper + driver
+# verify_queue promotion into findings_inventory.md
+# ---------------------------------------------------------------------------
+
+
+def _driver():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+    if "plamen_driver" in sys.modules:
+        del sys.modules["plamen_driver"]
+    return importlib.import_module("plamen_driver")
+
+
+def test_harvest_cross_domain_candidates_public_wrapper(tmp_path):
+    """The public wrapper returns the same SUBSTANTIVE CROSS-DOMAIN-DEP
+    candidates as the private harvester, without requiring the caller to load
+    the inventory itself first."""
+    cp = _cp()
+    _write_depth_findings(tmp_path, "depth_network_surface_findings.md", (
+        "### Finding [DNS-1]\n**Location**: p2p/handler.go:L42\n"
+        "Analysis. [CROSS-DOMAIN-DEP: external — destination wire format "
+        "decides whether the payload decodes]\n\n"
+        "### Finding [DNS-2]\n**Location**: p2p/handler.go:L88\n"
+        "Bare tag. [CROSS-DOMAIN-DEP: external]\n"
+    ))
+    candidates = cp.harvest_cross_domain_candidates(tmp_path)
+    assert len(candidates) == 1, candidates
+    assert candidates[0]["finding_id"] == "DNS-1"
+    assert candidates[0]["domain"] == "external"
+    assert "destination wire format" in candidates[0]["detail"]
+
+
+def test_harvest_cross_domain_candidates_wrapper_no_raise_when_no_inventory(tmp_path):
+    """No findings_inventory.md on disk (L1-shaped fresh scratchpad before the
+    inventory phase writes one) must not raise -- the harvester still scans
+    the depth artifact glob independent of inventory content."""
+    cp = _cp()
+    _write_depth_findings(tmp_path, "depth_state_trace_findings.md", (
+        "### Finding [DST-1]\n**Location**: state/sync.go:L10\n"
+        "[CROSS-DOMAIN-DEP: storage — pruning cursor freshness assumed by "
+        "the caller]\n"
+    ))
+    assert not (tmp_path / "findings_inventory.md").exists()
+    candidates = cp.harvest_cross_domain_candidates(tmp_path)
+    assert len(candidates) == 1, candidates
+
+
+def test_cross_domain_candidate_lands_in_findings_inventory(tmp_path):
+    """WP-D.2: an L1-shaped scratchpad with a depth file containing a real
+    `[CROSS-DOMAIN-DEP: external — ...]` tag -> harvest_cross_domain_candidates
+    returns NON-EMPTY AND the candidate lands in findings_inventory.md as a
+    NEEDS_VERIFICATION row via the driver's verify_queue promotion bridge."""
+    cp = _cp()
+    _write_depth_findings(tmp_path, "depth_external_findings.md", (
+        "### Finding [DX-7]\n**Location**: rpc/engine_api.go:L200\n"
+        "Analysis. [CROSS-DOMAIN-DEP: external — downstream consumer decodes "
+        "this payload with an unverified schema]\n"
+    ))
+    _write_inventory(tmp_path, [
+        {"id": "INV-001", "severity": "High", "location": "rpc/engine_api.go:L5",
+         "verdict": "CONFIRMED", "root_cause": "unrelated real finding"},
+    ])
+
+    candidates = cp.harvest_cross_domain_candidates(tmp_path)
+    assert candidates, "expected a non-empty candidate list"
+
+    d = _driver()
+    promoted = d._promote_cross_domain_candidates_to_inventory(tmp_path)
+    assert promoted, "expected at least one promoted INV id"
+
+    inv_text = (tmp_path / "findings_inventory.md").read_text(encoding="utf-8")
+    for inv_id in promoted:
+        assert f"[{inv_id}]" in inv_text
+    assert "NEEDS_VERIFICATION" in inv_text
+    assert "downstream consumer decodes this payload" in inv_text
+    # Never a hard CONFIRMED body finding for a mechanically-harvested candidate.
+    assert "**Verdict**: CONFIRMED" not in inv_text.split(
+        "Cross-Domain Dependency Candidates"
+    )[1]
+
+
+def test_cross_domain_promotion_is_noop_without_inventory(tmp_path):
+    """Best-effort: no findings_inventory.md on disk -> the driver promotion
+    bridge degrades to a no-op instead of raising."""
+    d = _driver()
+    assert d._promote_cross_domain_candidates_to_inventory(tmp_path) == []

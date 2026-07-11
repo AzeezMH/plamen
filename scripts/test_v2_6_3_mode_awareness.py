@@ -184,6 +184,12 @@ def test_never_cut_artifacts_core_mode():
             "depth_state_trace_findings.md",
             "depth_external_findings.md",
             "depth_edge_case_findings.md",
+            # L1-4: scanner floor is Core+ (mirrors SC blind-spot A/B/C +
+            # validation sweep).
+            "blind_spot_a_findings.md",
+            "blind_spot_b_findings.md",
+            "blind_spot_c_findings.md",
+            "validation_sweep_findings.md",
             "confidence_scores.md",
         ]:
             (sp / f).write_text("# Findings\n\nSome content here.\n", encoding="utf-8")

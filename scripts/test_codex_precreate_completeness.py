@@ -317,5 +317,10 @@ def test_l1_depth_seeds_l1_never_cut(tmp_path):
     assert (scratchpad / "depth_consensus_invariant_findings.md").exists()
     assert (scratchpad / "depth_network_surface_findings.md").exists()
     assert (scratchpad / "confidence_scores.md").exists()
-    # SC-only scanners NOT seeded under L1.
-    assert not (scratchpad / "blind_spot_a_findings.md").exists()
+    # L1-4: L1 now has its own scanner floor (mirrors SC's blind-spot A/B/C +
+    # validation sweep) as of the L1 rigor buildout, so these ARE seeded under
+    # L1 core too -- Codex needs a target file to apply_patch into.
+    assert (scratchpad / "blind_spot_a_findings.md").exists()
+    assert (scratchpad / "blind_spot_b_findings.md").exists()
+    assert (scratchpad / "blind_spot_c_findings.md").exists()
+    assert (scratchpad / "validation_sweep_findings.md").exists()

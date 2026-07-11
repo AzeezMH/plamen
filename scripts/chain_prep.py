@@ -734,6 +734,32 @@ def _harvest_cross_domain_enablers(scratchpad: Path, entries: list[dict]) -> lis
         return []
 
 
+def harvest_cross_domain_candidates(scratchpad: Path) -> list[dict]:
+    """Public, read-only wrapper around `_harvest_cross_domain_enablers`.
+
+    WP-D (L1-3): loads the current findings inventory and returns every
+    SUBSTANTIVE `[CROSS-DOMAIN-DEP: {domain} — {detail}]` candidate harvested
+    from the depth/scanner/sibling finding artifacts (`_CROSS_DOMAIN_SOURCE_GLOBS`
+    already covers `blind_spot_*_findings.md`, `validation_sweep_findings.md`,
+    and `sibling_propagation_findings.md`, so WP-B/WP-C scanner and sibling
+    output is picked up automatically). Each dict carries
+    `finding_id` / `domain` / `detail` / `location` / `source_file`.
+
+    Callable independently of the chain phase (chain_prep's own
+    `compute_enabler_baseline` also calls the same private harvester to build
+    `enabler_results.md`); this wrapper lets other phases -- e.g. the L1
+    verify_queue pre-hook -- consume the same candidates without depending on
+    chain having run first. Best-effort: never raises, returns [] on any
+    failure (missing/absent findings_inventory.md, malformed artifacts, etc).
+    """
+    try:
+        scratchpad = Path(scratchpad)
+        entries = _load_inventory(scratchpad)
+        return _harvest_cross_domain_enablers(scratchpad, entries)
+    except Exception:
+        return []
+
+
 def compute_enabler_baseline(scratchpad: Path) -> dict:
     """Overwrite enabler_results.md with a STEP 0a dangerous-state baseline.
 
