@@ -73,6 +73,47 @@ Allowed no-execution reasons:
 - `PURE_SPEC_OR_DOCS_ONLY`
 - `STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION` (structural/integration only)
 
+## Force-by-Default Skip Justification (MANDATORY — closed taxonomy)
+
+`STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION` is NOT a valid skip reason for a
+finding with a concrete Material Harm (a fund, state, privilege, liveness, or
+accounting delta — see Material Harm in `finding-output-format.md`). The
+default for such a finding is to FORCE the PoC. A skip requires citing a
+SPECIFIC blocker from this CLOSED taxonomy, with a CODE-GROUNDED
+justification the driver will check:
+
+- `FULLY_TRUSTED_DESIGN` — name the fully-trusted governance/upgrade actor
+  AND the absent control that would otherwise gate the action.
+- `DEPLOY_OR_TX_ORDERING` — name the initializer/setup function AND the
+  cross-transaction deploy-gap race the harm depends on.
+- `EXTERNAL_DEP_NO_FORK` — name the out-of-scope external call or address
+  the harm depends on.
+- `LIVE_ARTIFACT_REQUIRED` — name the separately-compiled/deployed artifact
+  the PoC needs that is not available in this run.
+- `SPEC_DOCS_NO_STATE_DELTA` — the claim has no on-chain state delta to
+  assert (pure spec/docs mismatch).
+- A `REFUTED` verifier verdict (the harm does not hold, so no PoC is owed).
+
+A bare `STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION` with no named blocker from
+this list is a phase failure for a Material-Harm finding — reclassify the
+row and attempt the test, or cite the specific taxonomy entry above instead.
+
+A forced attempt that genuinely cannot assert the harm — after applying the
+Assertion Retry Protocol below — records `[CODE-TRACE]` plus the specific
+named blocker, NOT `[POC-FAIL]`. `[POC-FAIL]` is reserved for a
+harm-asserting test that compiled, ran, and the claimed harm did not
+reproduce; it is never the tag for "could not construct a harm assertion."
+
+**TTL / liveness / archival is testable, not structural.** For Soroban and
+other cargo-based ledgers with an explicit entry-lifetime model, TTL and
+archival-eviction harms ARE testable in-process: advance the ledger sequence
+via `Ledger::with_mut` (`li.sequence_number += N`) and read the entry's
+remaining lifetime via `get_ttl()` (or the SDK's equivalent) to assert
+eviction or extension behavior directly. "`Env::default()` cannot model
+eviction" is NOT a valid `STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION`
+justification for a TTL/archival finding — the ledger-clock advance above is
+exactly the tool that models it.
+
 ## Execution Protocol
 
 1. **Write** the PoC using templates from the language-specific prompt

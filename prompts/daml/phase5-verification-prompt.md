@@ -105,11 +105,44 @@ the evidence tag is finalized. Source-of-truth schema:
 `unit` and `property` rows require a real executable attempt when a
 build/test harness exists. \"no Script written\" with `[CODE-TRACE]`
 fallback is INVALID unless the ledger names an environmental blocker.
-For DAML the ONLY legitimate no-attempt reason is `NO_BUILD_ENVIRONMENT`:
-once `daml build` succeeds, `daml test` is always available (in-memory
-ledger, no external dependency, no fork or live address needed), so the
-external-dependency / live-deployment / spec-only / structural skip
-reasons do NOT apply.
+For DAML the default legitimate no-attempt reason is `NO_BUILD_ENVIRONMENT`:
+once `daml build` succeeds, `daml test` is always available (single-participant,
+in-memory ledger, no fork or live address needed) for single-participant
+claims, so the external-dependency / live-deployment / spec-only / structural
+skip reasons rarely apply. See the Force-by-Default block below for the
+narrow, code-grounded exceptions.
+
+### Force-by-Default Skip Justification (MANDATORY)
+
+`STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION` is NOT a valid skip for a finding
+with a concrete Material Harm (a locked/lost asset, an unauthorized
+archive/exercise, a controller/signatory privilege escalation, an
+`ensure`-gap that lets an invalid contract become creatable, or a liveness
+brick that denies a party its only path to a choice). The default is to
+FORCE the `daml test` Script proof. A skip requires citing a SPECIFIC
+blocker from the closed taxonomy in `~/.claude/rules/phase5-poc-execution.md`
+§ "Force-by-Default Skip Justification" — `FULLY_TRUSTED_DESIGN`,
+`DEPLOY_OR_TX_ORDERING`, `EXTERNAL_DEP_NO_FORK`, `LIVE_ARTIFACT_REQUIRED`,
+`SPEC_DOCS_NO_STATE_DELTA`, or a `REFUTED` verdict — with a code-grounded
+justification (name the fully-trusted signatory/controller and the absent
+counter-authorization, the cross-`submit` transaction-ordering race, the
+out-of-scope external/cross-domain participant, the separately-deployed
+DAR/sandbox artifact, or the absent contract-state delta). A forced attempt
+that genuinely cannot assert the harm records `[CODE-TRACE]` plus the named
+blocker, NOT `[POC-FAIL]` — `[POC-FAIL]` is reserved for a harm-asserting
+Script that ran and the claimed harm did not reproduce.
+
+**`daml test`'s in-memory ledger is not, by itself, a valid
+`EXTERNAL_DEP_NO_FORK` / `LIVE_ARTIFACT_REQUIRED` excuse.** Once `daml build`
+succeeds, `daml test` runs a single default participant with no external
+process: party allocation (`allocateParty`), time advance (`passTime`), and
+multi-choice/multi-party sequences are all directly testable, so a bare
+\"cannot model this\" claim is INVALID for single-participant harm. Those two
+blockers remain available ONLY for a claim whose harm genuinely depends on
+multi-participant / cross-domain Canton topology (for example a
+disclosed-contract or divulgence claim that requires a second participant
+node) that a single-participant `daml test` Script cannot model — name the
+specific cross-participant mechanism when citing either blocker.
 
 ## ANTI-HALLUCINATION RULES
 

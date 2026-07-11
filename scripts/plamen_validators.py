@@ -19904,8 +19904,218 @@ def _valid_poc_skip(
     return True
 
 
+# ── Force-by-default PoC gate: closed taxonomy of code-grounded skip blockers ──
+# ROOT CAUSE: `_poc_contract_required` keyed the mandatory-PoC decision off the
+# finding's PoC CLASS (queue estimate or verifier self-declaration), and that
+# class is PROVEN-UNRELIABLE — the mechanical seed `classify_poc_testability`
+# defaults hard-to-classify findings to `structural`, and empirically EVERY
+# sampled lazy skip (a concrete testable harm self-declared structural with NO
+# real blocker) rode that default straight past the gate. The fix flips the
+# default: a finding whose verify content asserts a CONCRETE material harm is
+# FORCED into a testable PoC class UNLESS a real, CLOSED, code-grounded
+# blocker excuses it. GENERIC vocabulary only (no protocol/contract names),
+# negation-aware via the shared `_poc_kw_present` guard.
+
+_MATERIAL_HARM_PATTERNS = (
+    "drain", "drained", "draining",
+    "lock", "locked", "locking", "lockout",
+    "freeze", "frozen", "freezing",
+    "brick", "bricked", "bricking",
+    "mint", "minted", "minting",
+    "steal", "stolen", "stealing",
+    "insolven",
+    "mis-account", "misaccount", "mis-accounted", "misaccounted",
+    "privilege escalation", "escalate privilege", "escalates privilege",
+    "over-withdraw", "overwithdraw", "over withdraw",
+    "double-spend", "double spend",
+    "lose funds", "loses funds", "losing funds", "lost funds",
+    "fund loss", "funds lost", "loss of funds",
+    "permanently halt", "permanently disabled", "permanently locked",
+    "denial of service", "griefing",
+    "unauthorized mint", "unauthorized transfer", "unrecoverable",
+    "halts block production", "liveness brick", "archiv",
+)
+
+
+def _has_concrete_material_harm(content: str) -> bool:
+    """Generic, negation-aware matcher (mirrors `_matches_external_integration_harm`):
+    does the verify content assert a CONCRETE fund/state/privilege/liveness/
+    accounting delta (drain / lock / mint / mis-account / brick / freeze /
+    escalate / steal / insolvency / ...) per the Material Harm field mandated
+    by `~/.plamen/rules/finding-output-format.md`?
+
+    Scoped to the Material Harm / Impact field when present (the field the
+    methodology mandates for exactly this assertion); falls back to the full
+    body when neither field is present so an unusual ledger shape still gets
+    scanned. Force-by-default direction: ambiguity (no field found) routes
+    TOWARD scanning the whole body, never straight to "no harm"."""
+    if not content:
+        return False
+    # RECALL-SAFE direction (load-bearing): this matcher gates the
+    # SPEC_DOCS_NO_STATE_DELTA blocker (a skip is excused only when NO material
+    # harm is asserted). UNDER-matching wrongly excuses a real finding — the
+    # exact H-01 regression: the verifier's PoC-ledger phrase "No fund-drain
+    # assertion ..." made the shared NEGATION-AWARE `_poc_kw_present` guard
+    # suppress the many POSITIVE "drain of custodied IBT is achievable" mentions,
+    # so a flagship fund-drain read as "no harm" and skipped the force floor.
+    # OVER-matching only ever forces an (at worst wasted) PoC attempt and can
+    # never drop a finding, so scan the FULL body with a PLAIN leading-boundary
+    # keyword search (matches inflections: drain/drains/draining/drainable) and
+    # do NOT apply the negation guard here.
+    hay = content.lower()
+    return any(
+        re.search(r"\b" + re.escape(p.lower()), hay) for p in _MATERIAL_HARM_PATTERNS
+    )
+
+
+# FULLY_TRUSTED_DESIGN blocker: the harm actor is a FULLY-TRUSTED authority
+# (governance/DAO/timelock/multisig/upgrade authority) acting WITHIN its
+# granted powers, with no runtime defect a non-trusted actor could trigger —
+# e.g. a PoC would only re-demonstrate that an upgrade authority can upgrade.
+# A SEMI-trusted role (admin/operator/keeper/oracle/harvester/relayer/...) is
+# explicitly NOT this blocker — semi-trusted-role abuse is a real, testable
+# harm and must still be forced.
+_FULLY_TRUSTED_AUTHORITY_ROLE_PATTERNS = (
+    "governance", "dao", "timelock", "multisig", "multi-sig",
+    "upgrade authority", "upgrade admin", "protocol owner",
+)
+_FULLY_TRUSTED_ABSENCE_OF_CONTROL_PATTERNS = (
+    "no timelock", "without a timelock", "absence of timelock",
+    "no m-of-n", "without m-of-n", "absence of m-of-n",
+    "as designed", "works as designed", "re-demonstrates",
+    "within its powers", "within powers", "acting within its authority",
+)
+
+
+def _has_fully_trusted_actor_blocker(content: str) -> bool:
+    """FULLY_TRUSTED_DESIGN blocker: reuses the structured `[TRUSTED-ACTOR]` /
+    `Trust Adj.` tagging (`_MATRIX_TRUST_FULLY_RE`) OR free-form fully-trusted-
+    authority language — an explicit `fully-trusted` marker CO-LOCATED with a
+    governance/DAO/timelock/multisig/upgrade-authority actor AND
+    absence-of-control language (no timelock, no M-of-N, "as designed"). An
+    explicit `semi-trusted` marker ALWAYS overrides to False — a semi-trusted
+    role is never this blocker."""
+    if not content:
+        return False
+    if re.search(r"\bsemi[-\s]trusted\b", content, re.IGNORECASE):
+        return False
+    if _MATRIX_TRUST_FULLY_RE.search(content):
+        return True
+    has_marker = bool(re.search(r"\bfully[-\s_]trusted\b", content, re.IGNORECASE))
+    has_authority = any(
+        _poc_kw_present(p, content) for p in _FULLY_TRUSTED_AUTHORITY_ROLE_PATTERNS
+    )
+    has_absence = any(
+        _poc_kw_present(p, content) for p in _FULLY_TRUSTED_ABSENCE_OF_CONTROL_PATTERNS
+    )
+    return has_marker and has_authority and has_absence
+
+
+# DEPLOY_OR_TX_ORDERING blocker: harm is a deploy-time / initialize-time
+# ordering race (front-running the constructor/initializer), not a runtime
+# defect a PoC harness can reproduce deterministically post-deployment.
+_DEPLOY_FN_RE = re.compile(
+    r"\b(?:initialize|__constructor|constructor|deploy(?:ment)?)\b",
+    re.IGNORECASE,
+)
+_DEPLOY_ORDERING_RACE_RE = re.compile(
+    r"\bfront[-\s]?run\w*\b"
+    r"|\bgap\s+between\s+deploy(?:ment)?\b"
+    r"|\b(?:tx|transaction)\s+order(?:ing)?\b"
+    r"|\bdeploy(?:ment|-time)?\s+(?:front[-\s]?run|race)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_deploy_ordering_blocker(content: str) -> bool:
+    """DEPLOY_OR_TX_ORDERING blocker: the cited function is
+    initialize/__constructor/deploy AND the harm is an ordering race
+    (front-running the deploy/initialize step, transaction ordering)."""
+    if not content:
+        return False
+    return bool(_DEPLOY_FN_RE.search(content)) and bool(
+        _DEPLOY_ORDERING_RACE_RE.search(content)
+    )
+
+
+# LIVE_ARTIFACT_REQUIRED blocker: the harm needs a SEPARATELY-compiled
+# malicious artifact (a second contract/program deployed by the attacker) that
+# a single-harness unit/property PoC cannot self-contain.
+_LIVE_ARTIFACT_PATTERNS = (
+    "malicious contract", "malicious artifact", "attacker contract",
+    "attacker-controlled contract", "second contract", "second deployment",
+    "separately compiled", "separately-compiled",
+    "deploy a malicious", "requires deploying", "requires a separate deploy",
+    "custom contract must be deployed",
+)
+
+
+def _has_live_artifact_blocker(content: str) -> bool:
+    """LIVE_ARTIFACT_REQUIRED blocker: harm requires a separately-compiled
+    malicious artifact / second-contract deploy the PoC cannot self-contain."""
+    if not content:
+        return False
+    return any(_poc_kw_present(p, content) for p in _LIVE_ARTIFACT_PATTERNS)
+
+
+def _has_refuted_verdict(content: str) -> bool:
+    """REFUTED blocker: the verifier's own verdict is REFUTED — no positive
+    harm is left to test."""
+    if not content:
+        return False
+    verdict = _field_from_markdown(content, ("Verdict", "Final Verdict", "Status"))
+    return bool(re.search(r"\bREFUTED\b", verdict or "", re.IGNORECASE))
+
+
+def _has_valid_skip_blocker(
+    content: str,
+    severity: str = "",
+    scratchpad: Optional[Path] = None,
+) -> bool:
+    """Closed, code-grounded taxonomy of blockers that legitimately excuse a
+    concrete-material-harm finding from the force-by-default PoC floor.
+
+    Recall-safe by construction: this is a CLOSED allowlist, not a catch-all.
+    A finding with a concrete material harm that does NOT match one of these
+    six blockers is forced into a testable PoC class regardless of its
+    self-declared/queue class label.
+    """
+    if not content:
+        return False
+    if _has_refuted_verdict(content):
+        return True
+    if _has_fully_trusted_actor_blocker(content):
+        return True
+    if _has_deploy_ordering_blocker(content):
+        return True
+    if _has_live_artifact_blocker(content):
+        return True
+    # EXTERNAL_DEP_NO_FORK: mirrors the fork-PoC mandate invalidation logic in
+    # `_valid_poc_skip` exactly — an external-integration fund-drain/misrouting
+    # harm is a valid blocker UNLESS a fork PoC is actually runnable here
+    # (Medium+ severity + a named resolvable deployed address + reachable RPC
+    # egress). With no reachable RPC (the common case) the blocker stays valid.
+    if _matches_external_integration_harm(content):
+        fork_actually_runnable = (
+            scratchpad is not None
+            and normalize_severity(severity) in {"Critical", "High", "Medium"}
+            and _names_resolvable_deployed_address(content)
+            and _egress_rpc_reachable(scratchpad)
+        )
+        if not fork_actually_runnable:
+            return True
+    # SPEC_DOCS_NO_STATE_DELTA: no concrete material harm asserted at all — a
+    # pure doc/naming/spec mismatch with no state delta to test.
+    if not _has_concrete_material_harm(content):
+        return True
+    return False
+
+
 def _effective_poc_class(
-    queue_class: str, content: Optional[str] = None
+    queue_class: str,
+    content: Optional[str] = None,
+    severity: str = "",
+    scratchpad: Optional[Path] = None,
 ) -> str:
     """Resolve the effective PoC class, honoring a verifier reclassification.
 
@@ -19955,6 +20165,22 @@ def _effective_poc_class(
             _names_resolvable_deployed_address(content):
         return poc_class if poc_class in {"unit", "property", "integration"} \
             else "integration"
+    # STICKY FLOOR 3 (force-by-default, load-bearing): a finding whose verify
+    # content asserts a CONCRETE material harm (fund/state/privilege/liveness/
+    # accounting delta) is FORCED into a testable class UNLESS a closed,
+    # code-grounded blocker (`_has_valid_skip_blocker`) excuses it —
+    # fully-trusted-design, deploy/tx-ordering race, external-dep-no-fork,
+    # live-artifact-required, spec/docs-no-state-delta, or a REFUTED verdict.
+    # This is the DEFAULT-FORCE floor: the queue/declared class (`structural`
+    # in particular) is proven-unreliable (`classify_poc_testability` defaults
+    # hard-to-classify findings to structural, and every sampled lazy skip
+    # rode that default) so it is NOT honored as a reason to skip a concrete
+    # harm. Label-independent — never honors ANY declared class (structural/
+    # integration/spec/docs) for a concrete-harm/no-blocker finding.
+    if _has_concrete_material_harm(content) and not _has_valid_skip_blocker(
+        content, severity, scratchpad
+    ):
+        return poc_class if poc_class in {"unit", "property"} else "property"
     declared_raw, _shape = _field_anywhere(
         content, ("PoC Class", "Poc Class"), table_ok=True
     )
@@ -19967,7 +20193,10 @@ def _effective_poc_class(
 
 
 def _poc_contract_required(
-    row: dict[str, str], mode: str, content: Optional[str] = None
+    row: dict[str, str],
+    mode: str,
+    content: Optional[str] = None,
+    scratchpad: Optional[Path] = None,
 ) -> bool:
     """Whether a mandatory unit/property PoC is contractually required for *row*.
 
@@ -19993,7 +20222,12 @@ def _poc_contract_required(
     # a locally-testable class (recall-safe: never relaxes below queue estimate
     # for a declared unit/property/omitted ledger). Shared with the aggregate
     # skip-vocabulary audit so both gates agree on the authoritative class.
-    poc_class = _effective_poc_class(row.get("poc class") or "", content)
+    # Also carries the force-by-default sticky floor (STICKY FLOOR 3): a
+    # concrete-material-harm finding with no valid code-grounded blocker is
+    # forced into a testable class regardless of the declared/queue label.
+    poc_class = _effective_poc_class(
+        row.get("poc class") or "", content, row.get("severity", ""), scratchpad
+    )
     if poc_class not in {"unit", "property"}:
         return False
     mode_l = (mode or "core").lower()
@@ -20032,9 +20266,18 @@ def _validate_poc_contract_for_rows(
     # on disk at gate time, which includes this shard's own outputs.
     mock_feasible, mock_example = _project_mock_feasible(scratchpad)
     for row in rows:
-        # First-pass cheap gate on the queue class (no I/O): if not even the
-        # queue estimate makes this testable, skip without reading the file.
-        if not _poc_contract_required(row, mode):
+        # First-pass cheap gate on MODE/SEVERITY only (no I/O, no class check):
+        # the queue `poc class` is a pre-code-read estimate that defaults
+        # hard-to-classify findings to `structural`, and the force-by-default
+        # sticky floor (STICKY FLOOR 3 in `_effective_poc_class`) can ONLY be
+        # evaluated against the verify CONTENT — so a class-only pre-filter
+        # here would silently exempt every lazy structural-seeded skip from
+        # ever having its content read. Mode/severity are class-independent
+        # and cost no I/O, so they remain a valid cheap pre-filter.
+        mode_l = (mode or "core").lower()
+        if mode_l == "light":
+            continue
+        if normalize_severity(row.get("severity", "")) not in {"Critical", "High", "Medium"}:
             continue
         fid = (row.get("finding id") or "").strip()
         if not fid:
@@ -20046,13 +20289,17 @@ def _validate_poc_contract_for_rows(
             content = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        # Second-pass gate using the verifier's DECLARED PoC Class ledger field:
-        # if the verifier non-silently reclassified this finding to a
-        # non-testable class (structural/integration/spec/docs), the mandatory
-        # unit/property contract no longer applies — demanding the PoC anyway is
-        # an unwinnable retry. The anti-gaming floor is preserved inside
-        # `_poc_contract_required` (a declared unit/property does NOT relax).
-        if not _poc_contract_required(row, mode, content):
+        # Authoritative gate using the verifier's DECLARED PoC Class ledger
+        # field AND the force-by-default concrete-material-harm floor — both
+        # resolved against CONTENT (never the unreliable queue-only class).
+        # If the verifier non-silently reclassified this finding to a
+        # non-testable class (structural/integration/spec/docs) WITH a valid
+        # blocker, the mandatory unit/property contract no longer applies —
+        # demanding the PoC anyway is an unwinnable retry. The anti-gaming
+        # floor is preserved inside `_poc_contract_required` (a declared
+        # unit/property does NOT relax; a concrete-harm/no-blocker finding is
+        # forced regardless of the declared label).
+        if not _poc_contract_required(row, mode, content, scratchpad):
             continue
         has_poc_section, has_exec_section = _has_poc_ledger_sections(content)
         if not has_poc_section or not has_exec_section:
@@ -20080,18 +20327,33 @@ def _validate_poc_contract_for_rows(
         attempted = _poc_attempted_value(content)
         attempted_yes = attempted == "YES"
         attempted_no = attempted == "NO"
-        poc_class = (row.get("poc class") or "structural").strip().lower()
+        raw_poc_class = (row.get("poc class") or "structural").strip().lower()
+        # Effective class subsumes ALL sticky floors (resource-exhaustion,
+        # external-integration fund-drain, and the force-by-default
+        # concrete-material-harm floor) so the `_valid_poc_skip` call below
+        # correctly rejects an inappropriate self-declared-non-testable skip
+        # for a row `_poc_contract_required` already determined is
+        # force-required — using the raw queue class here would silently
+        # re-open the exact escape hatch the force floors exist to close.
+        poc_class = _effective_poc_class(
+            raw_poc_class, content, row.get("severity", ""), scratchpad
+        )
         # MODE A floor: a resource-exhaustion / executable-harm finding is
-        # testable regardless of a structural self-declaration. Floor the local
-        # gate class to 'property' so the STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION
-        # skip (evaluated against poc_class below) is rejected, and suppress the
-        # structural/integration reclassification softening for it. Other
-        # findings keep their raw queue class (no regression).
+        # testable regardless of a structural self-declaration. Retained
+        # (unchanged from the original resource-exhaustion-only computation)
+        # to gate the reclassification-softening branch below alongside the
+        # new `force_floored` flag.
         forced_executable = _matches_resource_exhaustion(
             content, row.get("title", ""), row.get("bug class", "")
         )
-        if forced_executable:
-            poc_class = "property"
+        # Force-by-default (STICKY FLOOR 2/3): the effective class differs from
+        # the raw/queue class — i.e. a sticky floor (external-integration or
+        # concrete-material-harm) actually MOVED the class. Like
+        # `forced_executable`, this must ALSO suppress the reclassification-
+        # softening branch below — a declared structural/integration/spec/docs
+        # label must not let a concrete, unblocked harm dodge the mandatory
+        # PoC ("label-independent" force).
+        force_floored = poc_class != raw_poc_class
         if attempted_yes:
             command = _field_from_markdown(content, ("Command",))
             test_file = _field_from_markdown(content, ("Test File",))
@@ -20153,7 +20415,7 @@ def _validate_poc_contract_for_rows(
         # still fails — the verifier must DECLARE the reclassification — and
         # `_valid_poc_skip` still enforces mock-feasibility / class rules for
         # the declared class, so this opens no new bypass vector.
-        if attempted_no and not forced_executable:
+        if attempted_no and not forced_executable and not force_floored:
             declared_raw = (
                 _field_from_markdown(content, ("PoC Class", "Poc Class", "PoC class")) or ""
             ).strip().lower()
@@ -20388,6 +20650,36 @@ def _per_constituent_claim_match(
     return "single_winner", scores
 
 
+def _poc_fail_asserts_harm(content: str, poc_section: str) -> bool:
+    """Impact-Premise gate for POC-FAIL demotion (force-by-default Edit 5).
+
+    A demotion is a NEW severity reduction and must be evidence-backed by a
+    test that actually engaged the claimed harm, not merely a mechanism (per
+    `~/.plamen/rules/phase5-poc-execution.md` Impact Premise Verification).
+
+    Returns False (no-demote; the finding falls back to CODE-TRACE at its
+    pre-force disposition) ONLY when the ledger EXPLICITLY records
+    `Attempted: NO` (a genuine, structurally-declared skip — nothing was ever
+    run against the claimed harm) or an explicit no-executable-harm-assertion
+    disposition. A bare `[POC-FAIL]` tag on a declared-NO-attempt ledger
+    cannot be trusted to disprove that harm — this is exactly the "forced
+    attempt that cannot assert the harm" case Edit 5 targets.
+
+    Returns True (demotion allowed) in every other case, including the
+    common already-shipped shape where the `Attempted` field is absent but a
+    narrative execution outcome is present (legacy ledgers predate the
+    formal `Attempted:` field). Recall-safe: this can only SUPPRESS a
+    demotion for a declared-NO-attempt row, never sink a finding further and
+    never suppress a demotion for a genuine executed result.
+    """
+    scoped = poc_section or content
+    if re.search(r"no\s+executable\s+harm\s+assertion", scoped, re.IGNORECASE):
+        return False
+    if _poc_attempted_value(content) == "NO":
+        return False
+    return True
+
+
 def _apply_poc_fail_demotions(scratchpad: Path, mode: str) -> list[dict[str, str]]:
     """Demote findings where PoC mechanically disproved the claimed harm.
 
@@ -20456,6 +20748,14 @@ def _apply_poc_fail_demotions(scratchpad: Path, mode: str) -> list[dict[str, str
                 continue
 
         if has_mechanical_proof(content):
+            continue
+
+        # Force-by-default Edit 5 (no-demote floor): a [POC-FAIL] whose ledger
+        # shows NO harm-asserting test (Impact-Premise unmet) is treated as
+        # CODE-TRACE and the finding falls back to its pre-force disposition
+        # — NEVER demoted below baseline. Only a harm-asserting PoC that ran
+        # and failed demotes.
+        if not _poc_fail_asserts_harm(content, poc_section):
             continue
 
         if poc_class == "integration":

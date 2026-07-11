@@ -119,6 +119,21 @@ Every output must include:
 - Command: <forge/hardhat command or N/A>
 ```
 
+### Force-by-Default Skip Justification (MANDATORY)
+
+`STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION` is NOT a valid skip for a finding
+with a concrete Material Harm (fund/state/privilege/liveness/accounting
+delta). The default is to FORCE the PoC. A skip requires citing a SPECIFIC
+blocker from the closed taxonomy in `~/.claude/rules/phase5-poc-execution.md`
+§ "Force-by-Default Skip Justification" — `FULLY_TRUSTED_DESIGN`,
+`DEPLOY_OR_TX_ORDERING`, `EXTERNAL_DEP_NO_FORK`, `LIVE_ARTIFACT_REQUIRED`,
+`SPEC_DOCS_NO_STATE_DELTA`, or a `REFUTED` verdict — with a code-grounded
+justification (name the trusted actor, the initializer, the external call,
+the artifact, or the absent state delta). A forced attempt that genuinely
+cannot assert the harm records `[CODE-TRACE]` plus the named blocker, NOT
+`[POC-FAIL]` — `[POC-FAIL]` is reserved for a harm-asserting test that ran
+and the harm did not reproduce.
+
 ## ANTI-HALLUCINATION RULES (MANDATORY)
 
 1. You MUST read the actual source files BEFORE writing any test or analysis. Do NOT guess function signatures, parameter types, or return values.

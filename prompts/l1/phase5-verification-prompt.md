@@ -104,6 +104,24 @@ If no mechanical verification is feasible for a hypothesis (no spec tests, no ha
 4. **Cap severity at HIGH** — Critical findings cannot rest on LSP-TRACE alone. Escalate Critical LSP-TRACE findings to CONTESTED and flag for human review.
 
 
+## Force-by-Default Skip Justification (MANDATORY)
+
+`STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION` is NOT a valid skip for a finding with a
+concrete Material Harm (fund/state/privilege/liveness/accounting/consensus-safety
+delta). The default is to FORCE a proof in the form the bug class supports — a
+`unit`/`property` PoC where the harm is a single-node assertion, else the class's
+own harness (`[DIFF-PASS]` differential, `[NON-DET-PASS]` non-determinism,
+`[FUZZ-PASS]` fuzz, `[CONFORMANCE-PASS]` spec-conformance). A skip requires citing
+a SPECIFIC blocker from the closed taxonomy in
+`~/.claude/rules/phase5-poc-execution.md` § "Force-by-Default Skip Justification" —
+`FULLY_TRUSTED_DESIGN`, `DEPLOY_OR_TX_ORDERING`, `EXTERNAL_DEP_NO_FORK`,
+`LIVE_ARTIFACT_REQUIRED`, `SPEC_DOCS_NO_STATE_DELTA`, or a `REFUTED` verdict — with
+a code-grounded justification. A forced attempt that genuinely cannot assert the
+harm records `[CODE-TRACE]` plus the named blocker, NOT `[POC-FAIL]`. (L1 note: a
+harm that genuinely needs a 2nd client or a live testnet — not runnable here —
+records `[CODE-TRACE]` + `EXTERNAL_DEP_NO_FORK`/`LIVE_ARTIFACT_REQUIRED`, never a
+generic structural dodge.)
+
 ## PoC Attempt Protocol (Thorough/Core — MANDATORY for poc_class: unit|property)
 
 > **v2.4.0**: Testability classification is computed mechanically by the Python driver.

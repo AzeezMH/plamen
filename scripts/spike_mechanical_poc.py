@@ -150,13 +150,27 @@ _CMD_FEATURES_RE = re.compile(
 # captured when present, while a bare `tests/foo.rs` (no crate prefix) still
 # matches exactly as before via the zero-repetition case. EVM is unaffected
 # (byte-identical) — Foundry projects are single-root, not multi-crate.
+#
+# The same truncation applies to Move (aptos/sui): a Move package is its own
+# `Move.toml` root with a sibling `sources/`+`tests/` pair, and a repo with
+# multiple packages (Sui "local dependencies" / Aptos workspace members) puts
+# each package under its own directory, e.g. `packages/foo/tests/bar.move`.
+# The unanchored `re.search` for `(?:sources/)?tests?/...` starts matching AT
+# `tests/` and drops the `packages/foo/` package-directory prefix exactly like
+# the cargo case. Mirror the same optional-repeated-segment group here; the
+# `.move` extension and the `sources/` option are unchanged. Neither `sui move
+# test <filter>` nor `aptos move test --filter <name>` take a cargo-style `-p`
+# package flag — both run against the package rooted at the invocation cwd, so
+# resolving the FULL package-relative path (for cwd selection) is sufficient;
+# no package-flag threading analog is needed here (follow-up only if a
+# multi-package cd-selection gap surfaces in practice).
 _TEST_PATH_BY_LANG: dict[str, re.Pattern] = {
     "evm":     re.compile(r"((?:test|tests)/[\w.\-/]+\.t\.sol)"),
     "solana":  re.compile(r"((?:[\w.\-]+/)*(?:tests?/|trident-tests/)[\w.\-/]+\.rs)"),
     "soroban": re.compile(r"((?:[\w.\-]+/)*(?:src/)?tests?/[\w.\-/]+\.rs)"),
     "l1_rust": re.compile(r"((?:[\w.\-]+/)*(?:src/[\w.\-/]*?)?tests?/[\w.\-/]+\.rs)"),
-    "aptos":   re.compile(r"((?:sources/)?tests?/[\w.\-/]+\.move)"),
-    "sui":     re.compile(r"((?:sources/)?tests?/[\w.\-/]+\.move)"),
+    "aptos":   re.compile(r"((?:[\w.\-]+/)*(?:sources/)?tests?/[\w.\-/]+\.move)"),
+    "sui":     re.compile(r"((?:[\w.\-]+/)*(?:sources/)?tests?/[\w.\-/]+\.move)"),
     "l1_go":   re.compile(r"([\w.\-/]+_test\.go)"),
 }
 _TEST_EXT_BY_LANG: dict[str, tuple[str, ...]] = {
