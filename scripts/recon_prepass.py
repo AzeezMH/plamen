@@ -3216,6 +3216,295 @@ def _parse_sec3_sarif(scratch: Path, sarif_path: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Wave-2 A5: mechanical dependency-vulnerability scan (L1 only)
+# ---------------------------------------------------------------------------
+#
+# govulncheck (Go) / cargo audit (Rust) — a known-CVE dependency-vulnerability
+# scan against each toolchain's own advisory database. Structured hits are
+# handed to the depth/verify phases via `dependency_audit_findings.md`, same
+# "deterministic tool run -> structured hits -> markdown artifact" shape as
+# `_run_opengrep_scan` above. This is DISTINCT from `supply_chain_gate.py`'s
+# fail-closed IOC gate (typosquat / malicious-package detection at install
+# time) -- this is a vulnerability-database lookup against already-declared
+# dependencies, not an IOC denylist. Never raises: any toolchain absence or
+# tool failure degrades to a `TOOLCHAIN_UNAVAILABLE`/`FAILED` marker written
+# to disk so the pipeline continues (haltless-by-design).
+
+_GOVULNCHECK_TIMEOUT = 300  # seconds
+_CARGO_AUDIT_TIMEOUT = 180  # seconds
+
+
+def _parse_govulncheck_ndjson(raw: str) -> List[dict]:
+    """Parse `govulncheck -json` NDJSON stream into structured hits.
+
+    Each line is a `Message` with either an `osv` entry (vulnerability
+    metadata) or a `finding` (a concrete call-site trace). Only `finding`
+    messages are surfaced as hits -- `osv`-only messages describe the wider
+    vulnerability DB and are used only to backfill the summary text. Malformed
+    or partial lines are skipped rather than aborting the whole parse (the
+    stream can be truncated on timeout).
+    """
+    import json as _json
+
+    findings: List[dict] = []
+    osv_summary: Dict[str, str] = {}
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            msg = _json.loads(line)
+        except Exception:
+            continue
+        osv = msg.get("osv")
+        if isinstance(osv, dict) and osv.get("id"):
+            osv_summary[osv["id"]] = str(osv.get("summary", ""))
+        finding = msg.get("finding")
+        if isinstance(finding, dict) and finding.get("osv"):
+            trace = finding.get("trace") or []
+            top = trace[0] if trace and isinstance(trace[0], dict) else {}
+            osv_id = str(finding.get("osv", ""))
+            findings.append({
+                "id": osv_id,
+                "module": str(top.get("module", "")),
+                "package": str(top.get("package", "")),
+                "version": str(top.get("version", "")),
+                "function": str(top.get("function", "")),
+                "fixed_version": str(finding.get("fixed_version", "")),
+                "summary": osv_summary.get(osv_id, "")[:200],
+            })
+    return findings
+
+
+def _govulncheck_scan(proj: Path) -> Tuple[str, List[dict]]:
+    """Run `govulncheck -json ./...` against a Go module.
+
+    Returns (status, findings). status is one of:
+    WRITTEN | SKIPPED:{reason} | TOOLCHAIN_UNAVAILABLE:{reason} | FAILED:{reason}
+    """
+    if not shutil.which("govulncheck"):
+        return "TOOLCHAIN_UNAVAILABLE:govulncheck not found on PATH", []
+    if not (proj / "go.mod").exists():
+        return "SKIPPED:no go.mod", []
+
+    rc, out = _run_hardened(
+        ["govulncheck", "-json", "./..."], proj, _GOVULNCHECK_TIMEOUT,
+    )
+    if rc == 127:
+        return "TOOLCHAIN_UNAVAILABLE:govulncheck not found on PATH", []
+    if rc == 124:
+        return f"FAILED:timeout after {_GOVULNCHECK_TIMEOUT}s", []
+
+    findings = _parse_govulncheck_ndjson(out)
+    # govulncheck exits 0 (clean) or 3 (vulnerabilities found) on a normal
+    # run; any other exit code (1 = setup/analysis error, e.g. unresolved
+    # module graph) with zero parsed findings is a genuine tool failure, not
+    # a clean scan.
+    if not findings and rc not in (0, 3):
+        return f"FAILED:govulncheck exit {rc}", []
+    return "WRITTEN", findings
+
+
+def _parse_cargo_audit_json(raw: str) -> Tuple[List[dict], bool]:
+    """Parse `cargo audit --json` output into structured hits.
+
+    Returns (findings, parse_ok). `parse_ok` is False when the output was not
+    valid cargo-audit JSON at all -- this distinguishes a genuine tool/setup
+    failure (no Cargo.lock, advisory-db fetch failure) from a clean
+    zero-vulnerability run (which also produces valid JSON with an empty list).
+    """
+    import json as _json
+
+    text = (raw or "").strip()
+    # The combined stdout+stderr capture can carry a warning banner ahead of
+    # the JSON payload; locate the first '{' rather than assuming column 0.
+    brace = text.find("{")
+    if brace == -1:
+        return [], False
+    try:
+        data = _json.loads(text[brace:])
+    except Exception:
+        return [], False
+    vulns = ((data.get("vulnerabilities") or {}).get("list")) or []
+    findings: List[dict] = []
+    for v in vulns:
+        if not isinstance(v, dict):
+            continue
+        advisory = v.get("advisory") or {}
+        pkg = v.get("package") or {}
+        patched = ((v.get("versions") or {}).get("patched")) or []
+        cvss = advisory.get("cvss")
+        severity = ""
+        if isinstance(cvss, dict):
+            severity = str(cvss.get("severity") or "")
+        if not severity:
+            severity = str(advisory.get("severity") or "")
+        findings.append({
+            "id": str(advisory.get("id", "")),
+            "package": str(pkg.get("name", "")),
+            "version": str(pkg.get("version", "")),
+            "title": str(advisory.get("title", ""))[:200],
+            "severity": severity,
+            "patched": ", ".join(str(p) for p in patched) if patched else "",
+            "url": str(advisory.get("url", "")),
+        })
+    return findings, True
+
+
+def _cargo_audit_scan(proj: Path) -> Tuple[str, List[dict]]:
+    """Run `cargo audit --json` against a Rust workspace.
+
+    Returns (status, findings). status is one of:
+    WRITTEN | SKIPPED:{reason} | TOOLCHAIN_UNAVAILABLE:{reason} | FAILED:{reason}
+    """
+    if not shutil.which("cargo"):
+        return "TOOLCHAIN_UNAVAILABLE:cargo not found on PATH", []
+    if not (proj / "Cargo.toml").exists():
+        return "SKIPPED:no Cargo.toml", []
+
+    # cargo-audit is a cargo subcommand, not a standalone binary on PATH --
+    # probe it explicitly so a missing subcommand degrades to
+    # TOOLCHAIN_UNAVAILABLE instead of a confusing FAILED.
+    probe_rc, _probe_out = _run_hardened(
+        ["cargo", "audit", "--version"], proj, 30,
+    )
+    if probe_rc == 127:
+        return "TOOLCHAIN_UNAVAILABLE:cargo not found on PATH", []
+    if probe_rc != 0:
+        return "TOOLCHAIN_UNAVAILABLE:cargo-audit subcommand not installed", []
+
+    rc, out = _run_hardened(
+        ["cargo", "audit", "--json"], proj, _CARGO_AUDIT_TIMEOUT,
+    )
+    if rc == 124:
+        return f"FAILED:timeout after {_CARGO_AUDIT_TIMEOUT}s", []
+
+    findings, parse_ok = _parse_cargo_audit_json(out)
+    if not parse_ok:
+        if rc == 0:
+            # A clean run legitimately produces an empty vulnerabilities list;
+            # tolerate a parse miss on rc==0 as "0 findings" rather than FAILED.
+            return "WRITTEN", []
+        return f"FAILED:cargo audit exit {rc}, no JSON produced", []
+    return "WRITTEN", findings
+
+
+def _write_dependency_audit_md(
+    scratch: Path, sections: List[Tuple[str, str, List[dict]]],
+) -> int:
+    """Write `dependency_audit_findings.md` from one or more ecosystem scan
+    sections (Go / Rust). Returns the total finding count across sections."""
+    total = 0
+    lines = [
+        "# Dependency Audit Findings", "",
+        "> **Source**: mechanical `govulncheck` (Go) / `cargo audit` (Rust) scan.",
+        "> Distinct from the supply-chain IOC gate (typosquat / malicious-package",
+        "> detection at install time) -- this is a known-CVE dependency-",
+        "> vulnerability lookup against each toolchain's own advisory database.",
+        "",
+    ]
+    for label, status, findings in sections:
+        lines.append(f"## {label}")
+        lines.append("")
+        lines.append(f"**Status**: {status}")
+        lines.append("")
+        if status.startswith("TOOLCHAIN_UNAVAILABLE"):
+            lines.append(
+                "TOOLCHAIN_UNAVAILABLE: dependency-vulnerability scan skipped "
+                "for this ecosystem; degrading without findings."
+            )
+            lines.append("")
+            continue
+        if status.startswith(("SKIPPED", "FAILED")):
+            lines.append("")
+            continue
+        total += len(findings)
+        if not findings:
+            lines.append("No known-vulnerability dependency findings.")
+            lines.append("")
+            continue
+        if label.startswith("Go"):
+            lines += [
+                "| # | Advisory | Module | Package | Called Function | Fixed Version | Summary |",
+                "|---|----------|--------|---------|------------------|----------------|---------|",
+            ]
+            for i, f in enumerate(findings, 1):
+                summ = str(f.get("summary", "")).replace("|", "\\|").replace("\n", " ")
+                lines.append(
+                    f"| {i} | `{f.get('id', '')}` | `{f.get('module', '')}` | "
+                    f"`{f.get('package', '')}` | `{f.get('function', '')}` | "
+                    f"{f.get('fixed_version', '')} | {summ} |"
+                )
+        else:
+            lines += [
+                "| # | Advisory | Package | Version | Severity | Patched | Title |",
+                "|---|----------|---------|---------|----------|---------|-------|",
+            ]
+            for i, f in enumerate(findings, 1):
+                title = str(f.get("title", "")).replace("|", "\\|").replace("\n", " ")
+                lines.append(
+                    f"| {i} | `{f.get('id', '')}` | `{f.get('package', '')}` | "
+                    f"{f.get('version', '')} | {f.get('severity', '') or '-'} | "
+                    f"{f.get('patched', '') or '-'} | {title} |"
+                )
+        lines.append("")
+    _write_text(scratch / "dependency_audit_findings.md", "\n".join(lines))
+    return total
+
+
+def _run_dependency_audit_l1(scratch: Path, proj: Path, language: str) -> str:
+    """L1 mechanical dependency-vulnerability scan (Wave-2 A5).
+
+    Runs `govulncheck` for a Go module and/or `cargo audit` for a Rust
+    workspace (both for `language=mixed`) and writes the structured hits to
+    `dependency_audit_findings.md` for the depth/verify phases to consume.
+    DISTINCT from `supply_chain_gate.py`'s fail-closed IOC gate -- do not
+    conflate the two.
+
+    Never raises: any unexpected failure is caught and degrades to a `FAILED`
+    marker written to disk (haltless-by-design), matching the OpenGrep/SCIP
+    degrade-continue contract used elsewhere in this module.
+
+    Returns a combined status string, e.g.
+    'go=WRITTEN:3; rust=SKIPPED:no Cargo.toml'.
+    """
+    try:
+        lang = (language or "").strip().lower()
+        sections: List[Tuple[str, str, List[dict]]] = []
+        statuses: List[str] = []
+        if lang in ("go", "mixed"):
+            status, findings = _govulncheck_scan(proj)
+            sections.append(("Go (govulncheck)", status, findings))
+            statuses.append(
+                f"go={status}:{len(findings)}" if status == "WRITTEN" else f"go={status}"
+            )
+        if lang in ("rust", "mixed"):
+            status, findings = _cargo_audit_scan(proj)
+            sections.append(("Rust (cargo audit)", status, findings))
+            statuses.append(
+                f"rust={status}:{len(findings)}" if status == "WRITTEN" else f"rust={status}"
+            )
+        if not sections:
+            reason = f"TOOLCHAIN_UNAVAILABLE:no govulncheck/cargo-audit route for language={lang!r}"
+            sections.append(("Dependency Audit", reason, []))
+            statuses.append(reason)
+        _write_dependency_audit_md(scratch, sections)
+        return "; ".join(statuses)
+    except Exception as e:
+        # Absolute degrade-continue floor -- never let this step raise into
+        # the pre-pass/pre-breadth hook. Still leave a marker artifact so
+        # downstream gates see a real file rather than a missing one.
+        try:
+            _write_text(
+                scratch / "dependency_audit_findings.md",
+                f"# Dependency Audit Findings\n\nFAILED:{e.__class__.__name__}\n",
+            )
+        except Exception:
+            pass
+        return f"FAILED:{e.__class__.__name__}"
+
+
+# ---------------------------------------------------------------------------
 # Cosmos-SDK / CometBFT framework detection (L1)
 # ---------------------------------------------------------------------------
 #
@@ -3512,6 +3801,96 @@ def _seed_cross_chain_msg_flag(scratch: Path, proj: Path) -> str:
         return f"FAILED:{e.__class__.__name__}"
 
 
+# ---------------------------------------------------------------------------
+# Wave-2 A6: embedded Move-source detection (L1) -- closes the L1<->Move
+# skill-lane seam. An L1 (Go/Rust node-client) repo can embed a Move-VM
+# execution layer as `.move` sources; those files currently get no Move
+# methodology at all. Reuses the SAME `.move` suffix scan already used for
+# native Aptos/Sui SC audits (`_production_source_files(proj, (".move",))`,
+# see `_bake_move_graph` above and `_OPENGREP_LANG_EXT`) -- the trigger is the
+# file extension, never a protocol/chain name (Part-0). ROUTING ONLY: this
+# just sets the HAS_MOVE_SOURCES flag; the depth-agent prompt builder in
+# plamen_driver.py is what routes the already-vetted aptos/sui core Move
+# skills (MOVE_SAFETY_CORE_DIRECTIVES / ABILITY_ANALYSIS / TYPE_SAFETY) into
+# depth-state-trace / depth-external when this flag is set.
+# ---------------------------------------------------------------------------
+
+
+def _detect_move_sources_l1(proj: Path) -> bool:
+    """True when the L1 repo contains at least one production `.move` source
+    file (an embedded Move-VM execution layer). Mechanism-only: reuses the
+    existing production-source `.move` suffix scan. Never raises."""
+    try:
+        return bool(_production_source_files(proj, (".move",)))
+    except Exception:
+        return False
+
+
+def _seed_move_sources_flag(scratch: Path, proj: Path) -> str:
+    """If the L1 repo embeds `.move` sources, set HAS_MOVE_SOURCES and surface
+    a 'Move Skill Routing' section in `template_recommendations.md` so the
+    depth-agent prompt builder (plamen_driver.py `_build_depth_worker_prompt`)
+    can route the vetted aptos/sui core Move skills into depth-state-trace and
+    depth-external. Routing only -- no new methodology text, no new skill
+    files (the aptos/sui SKILL.md files are read verbatim).
+
+    Unlike `_seed_cosmos_flag`/`_seed_cross_chain_msg_flag`, the 3 routed
+    skill names are NOT rows in the L1 skill-index table (they live in the
+    aptos/sui trees), so this writes its own dedicated table section directly
+    rather than flipping an existing row via `_seed_mechanical_flag`'s
+    `rows_to_flip`. The shared flags-into-`detected_patterns.md` +
+    `recon_summary.md` steps are still reused (empty `rows_to_flip`).
+
+    Returns: DETECTED:HAS_MOVE_SOURCES | NOT_DETECTED | FAILED:{reason}
+    """
+    try:
+        if not _detect_move_sources_l1(proj):
+            return "NOT_DETECTED"
+
+        move_section = (
+            "\n### Move Skill Routing (mechanical — HAS_MOVE_SOURCES)\n\n"
+            "| Skill | Trigger | Required | Rationale |\n"
+            "|-------|---------|----------|-----------|\n"
+            + "".join(
+                f"| `{skill}` | `.move` sources embedded in L1 repo | YES | "
+                "Embedded Move-VM execution layer detected (mechanical `.move` "
+                "suffix scan). Routed into depth-state-trace and "
+                "depth-external. |\n"
+                for skill in (
+                    "MOVE_SAFETY_CORE_DIRECTIVES", "ABILITY_ANALYSIS", "TYPE_SAFETY",
+                )
+            )
+        )
+        tr = scratch / "template_recommendations.md"
+        if tr.exists() and _read_text(tr).split("\n", 1)[0] == _PREPASS_MARKER:
+            _force_overwrite_prepass(tr, _read_text_unmarked(tr) + move_section)
+        elif not tr.exists():
+            _write_text(
+                tr,
+                "# Template Recommendations\n\n[LLM TO ENRICH] Pre-pass stub.\n"
+                + move_section,
+            )
+
+        _seed_mechanical_flag(
+            scratch,
+            rows_to_flip={},
+            flags=["HAS_MOVE_SOURCES"],
+            detected_patterns_header="embedded Move sources",
+            detected_patterns_body=(
+                "`.move` source files detected in this L1 (Go/Rust node-"
+                "client) repository -- an embedded Move-VM execution layer. "
+                "Routes the vetted aptos/sui core Move skills "
+                "(MOVE_SAFETY_CORE_DIRECTIVES, ABILITY_ANALYSIS, TYPE_SAFETY) "
+                "into depth-state-trace and depth-external."
+            ),
+            summary_note="embedded .move sources detected (mechanical)",
+        )
+
+        return "DETECTED:HAS_MOVE_SOURCES"
+    except Exception as e:
+        return f"FAILED:{e.__class__.__name__}"
+
+
 def _read_text_unmarked(p: Path) -> str:
     """Read a pre-pass file, stripping the leading marker line if present."""
     body = _read_text(p)
@@ -3684,6 +4063,11 @@ def run_recon_prepass(config: dict) -> Dict[str, str]:
     # flags. Manifest-priority, non-fatal.
     if pipeline == "l1":
         _safe("cosmos_flag", lambda: _seed_cosmos_flag(scratch, proj))
+        # Wave-2 A6: mechanical embedded-.move-source detection. Same
+        # manifest-priority, non-fatal dispatch as cosmos_flag above; routes
+        # the vetted aptos/sui core Move skills to depth-state-trace/external
+        # (see `_build_depth_worker_prompt` in plamen_driver.py).
+        _safe("move_sources_flag", lambda: _seed_move_sources_flag(scratch, proj))
 
     # SC (EVM): mechanical cross-chain message-handler marker detection —
     # second-channel backup to the LLM recon's own CROSS_CHAIN_MSG flag

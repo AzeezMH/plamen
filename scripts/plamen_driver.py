@@ -76,6 +76,15 @@ def _run_sec3_xray(scratch: Path, proj: Path) -> str:
 
     return _scan(scratch, proj)
 
+
+def _run_dependency_audit_l1(scratch: Path, proj: Path, language: str) -> str:
+    """Lazy wrapper so driver helper introspection sees the L1 dependency-
+    vulnerability scan runner (Wave-2 A5: govulncheck / cargo audit, invoked
+    from the pre-breadth hook, not startup)."""
+    from recon_prepass import _run_dependency_audit_l1 as _scan
+
+    return _scan(scratch, proj, language)
+
 # Rate-limit detection: JSON-first (structured), text-fallback (unstructured).
 #
 # BACKGROUND: Plain-text regex on the stdio log tail was the source of a
@@ -9409,6 +9418,89 @@ def _sc_skill_injection_block(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Wave-2 A6: L1<->Move skill-lane routing.
+#
+# An L1 (Go/Rust node-client) repo can embed a Move-VM execution layer as
+# `.move` sources -- e.g. a Move interpreter/verifier module linked into a
+# consensus/execution client. Those files currently receive zero Move
+# methodology because L1 depth roles have no Move skills of their own. This
+# routes the ALREADY-VETTED aptos/sui core Move skills
+# (MOVE_SAFETY_CORE_DIRECTIVES / ABILITY_ANALYSIS / TYPE_SAFETY, per
+# skill-index.md) into depth-state-trace and depth-external whenever recon's
+# mechanical `.move` suffix scan set HAS_MOVE_SOURCES
+# (`_seed_move_sources_flag` in recon_prepass.py). ROUTING ONLY: reuses the
+# aptos/sui SKILL.md files verbatim via `_sc_skill_path_for_name` -- no new
+# methodology text, no new skill files. Deliberately independent of
+# `_sc_skill_injection_block`/`_SC_SKILL_INJECT_EXCLUDE`: those enforce the
+# SC spawn_manifest.md-bound path where MOVE_SAFETY_CORE_DIRECTIVES is
+# excluded because SC breadth agents already receive it via the orchestrator
+# (commands/plamen.md) -- L1 has no such pathway, so this is a fresh,
+# independent injection point.
+# ---------------------------------------------------------------------------
+
+_L1_MOVE_ROUTING_SKILLS: tuple[str, ...] = (
+    "MOVE_SAFETY_CORE_DIRECTIVES", "ABILITY_ANALYSIS", "TYPE_SAFETY",
+)
+_L1_MOVE_ROUTING_ROLES = frozenset({"state_trace", "external"})
+
+
+def _l1_has_move_sources(scratchpad: Path) -> bool:
+    """True when recon's mechanical `.move` scan set HAS_MOVE_SOURCES for this
+    L1 repo. Checks `detected_patterns.md` first (the authoritative mechanical
+    flag-emission artifact written by `_seed_move_sources_flag`), falling back
+    to `template_recommendations.md` (the 'Move Skill Routing' section it also
+    writes). Never raises -- a missing/unreadable file simply means False."""
+    for name in ("detected_patterns.md", "template_recommendations.md"):
+        p = scratchpad / name
+        try:
+            if p.exists() and "HAS_MOVE_SOURCES" in p.read_text(
+                encoding="utf-8", errors="replace"
+            ):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _l1_move_skill_injection_block(scratchpad: Path, role: str) -> str:
+    """Build the MANDATORY Move-skill routing block for an L1 depth worker
+    prompt. Empty unless `role` is state_trace/external AND HAS_MOVE_SOURCES
+    is set, so the prompt is byte-identical for every other L1 role and for
+    every SC run (this function is only ever called when pipeline=="l1")."""
+    if str(role or "").strip().lower() not in _L1_MOVE_ROUTING_ROLES:
+        return ""
+    if not _l1_has_move_sources(scratchpad):
+        return ""
+    resolved: list[tuple[str, str]] = []
+    for name in _L1_MOVE_ROUTING_SKILLS:
+        p = _sc_skill_path_for_name(name)
+        if p is not None:
+            resolved.append((name, p.as_posix()))
+        else:
+            log.warning(
+                "[l1-move-routing] skill %r did not resolve to a SKILL.md -- "
+                "not injected", name,
+            )
+    if not resolved:
+        return ""
+    lines = [
+        "",
+        "## MOVE SKILL ROUTING (MANDATORY — mechanically injected, HAS_MOVE_SOURCES)",
+        "",
+        "Recon's mechanical scan found `.move` source files in this L1 repo "
+        "(an embedded Move-VM execution layer). The driver routed the vetted "
+        "Aptos/Sui core Move skills to your role. You MUST read each and "
+        "EXECUTE it against the `.move` sources in scope, in addition to your "
+        "normal L1 depth methodology.",
+        "",
+    ]
+    for name, posix in resolved:
+        lines.append(f"- Read and EXECUTE `{posix}` (skill `{name}`).")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _niche_jobs_from_spawn_manifest(scratchpad: Path) -> list[dict[str, str]]:
     """PRIMARY niche source: instantiate's ``spawn_manifest.md`` ``### Niche
     Agents`` table (>=5 columns: Niche Agent | Focus | Required | Agent ID |
@@ -9939,6 +10031,17 @@ Mandatory perturbation-retention contract for this role:
             )
         except Exception as exc:
             log.debug(f"[depth] skill-injection skipped for {role}: {exc!r}")
+    else:
+        # Wave-2 A6: route the vetted aptos/sui core Move skills into
+        # depth-state-trace/depth-external when this L1 repo embeds `.move`
+        # sources (HAS_MOVE_SOURCES). No-op (empty string) for every other
+        # role and for every run without embedded Move sources.
+        try:
+            depth_skill_block = _l1_move_skill_injection_block(
+                scratchpad, str(role)
+            )
+        except Exception as exc:
+            log.debug(f"[depth] L1 move-skill routing skipped for {role}: {exc!r}")
 
     standard_block = ""
     if category == "standard":
@@ -12549,10 +12652,31 @@ def run_phase(phase: Phase, config: dict, attempt: int) -> int:
                 )
                 status = _run_sec3_xray(scratchpad, _proj)
                 log.info(f"[{phase.name}] Sec3 X-Ray pre-breadth scan: {status}")
+            # Wave-2 A5: mechanical govulncheck (Go) / cargo audit (Rust)
+            # dependency-vulnerability scan. Mirrors the OpenGrep wiring above
+            # -- deferred to the pre-breadth hook (not startup) so the slow
+            # external scanner does not stall the silent-launch window, and
+            # idempotent on `dependency_audit_findings.md` presence so retries
+            # don't re-run it. pipeline=="l1"-gated; the SC path never reaches
+            # this branch. DISTINCT from supply_chain_gate.py's IOC gate.
+            if (
+                config.get("pipeline") == "l1"
+                and not (scratchpad / "dependency_audit_findings.md").exists()
+                and os.environ.get("PLAMEN_DISABLE_DEPENDENCY_AUDIT") != "1"
+            ):
+                display.print_phase_heartbeat(
+                    phase.name, 0,
+                    status="optional detector scan: dependency audit",
+                )
+                status = _run_dependency_audit_l1(scratchpad, _proj, _lang)
+                log.info(
+                    f"[{phase.name}] dependency-audit pre-breadth scan: {status}"
+                )
         except Exception as exc:
             log.warning(
-                f"[{phase.name}] SCIP/Sec3 pre-breadth scan skipped: {exc!r}; "
-                "continuing without graph/detector enrichment"
+                f"[{phase.name}] SCIP/Sec3/dependency-audit pre-breadth scan "
+                f"skipped: {exc!r}; continuing without graph/detector "
+                "enrichment"
             )
         try:
             sharded = shard_opengrep_obligations(scratchpad)

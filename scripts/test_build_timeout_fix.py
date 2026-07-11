@@ -149,7 +149,7 @@ class TestPrewarmWiredIntoPhase:
         monkeypatch.setattr(MV, "_read_recon_build_root", lambda s, l: tmp_path)
         monkeypatch.setattr(
             MV, "_run_test_for_finding",
-            lambda vf, br, lang, reg, tt, project_root=None: MV.ExecResult(
+            lambda vf, br, lang, reg, tt, project_root=None, **kwargs: MV.ExecResult(
                 verify_file=vf.name, finding_id="H-01", language=lang,
                 status="PASS"),
         )

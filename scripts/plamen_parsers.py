@@ -229,6 +229,8 @@ __all__ = [
     "_write_queue_excluded_manifest",
     "_write_queue_subset_manifest",
     "_queue_rows_from_inventory_with_exclusions",
+    "_read_pipeline_from_config",
+    "_matches_l1_nondeterminism_class",
     "compute_report_medium_shards",  # backward compat wrapper
     "compute_report_tier_shards",
     "classify_poc_testability",
@@ -2117,16 +2119,55 @@ def _matches_resource_exhaustion(*texts: str) -> bool:
     return any(_poc_kw_present(p, *texts) for p in RESOURCE_EXHAUSTION_PATTERNS)
 
 
-def classify_poc_testability(bug_class: str, preferred_tag: str, title: str, severity: str) -> str:
+
+# L1-only: bug classes whose harm is a race / non-determinism / Byzantine
+# divergence. Per prompts/l1/phase5-verification-prompt.md ("Non-determinism
+# findings" section, `[NON-DET-PASS]` via repeated execution) and
+# docs/l1-mode/design.md Section 8.2 ("Non-determinism findings -> try
+# [NON-DET-PASS] via repeated execution"; "Consensus invariant findings -> try
+# [CONFORMANCE-PASS]"), these classes have a MECHANIZED L1 evidence path and
+# `[CODE-TRACE]` alone is INSUFFICIENT for High/Critical verdicts on them (that
+# prompt's scoring rule caps CODE-TRACE-only evidence at CONTESTED). They must
+# NOT fall into the zero-PoC `structural` bucket the way genuinely untestable
+# L1 classes (timing/crash-recovery/cross-client/eclipse/network-partition,
+# explicitly named as untestable in phase5-verification-prompt.md's
+# `poc_class: structural` section) legitimately do. GENERIC bug-class
+# vocabulary only — no protocol/chain names.
+_L1_NONDETERMINISM_PATTERNS = (
+    "race condition", "data race", "non-determinism", "nondeterminism",
+    "byzantine",
+)
+
+
+def _matches_l1_nondeterminism_class(*texts: str) -> bool:
+    """True iff any *text* names a race/non-determinism/Byzantine bug class."""
+    return any(p in t for t in texts for p in _L1_NONDETERMINISM_PATTERNS)
+
+
+def classify_poc_testability(
+    bug_class: str,
+    preferred_tag: str,
+    title: str,
+    severity: str,
+    pipeline: str = "",
+) -> str:
     """Classify a finding's testability for PoC routing.
 
     Returns one of: 'unit', 'property', 'integration', 'structural'
 
     This is MECHANICAL — no LLM needed. Pattern-match on bug class + keywords.
+
+    `pipeline` is an OPTIONAL signal ("l1" for the Go/Rust node-client lane,
+    "sc"/"" for everything else). It defaults to "" so every existing caller
+    (none of which currently pass it) is byte-identical to prior behavior.
+    When pipeline == "l1", race/non-determinism/Byzantine bug classes route to
+    `property` instead of `structural` — see `_L1_NONDETERMINISM_PATTERNS`
+    above. SC pipelines never take this branch.
     """
     bc = (bug_class or "").lower()
     tag = (preferred_tag or "").lower()
     title_lc = (title or "").lower()
+    pipeline_lc = (pipeline or "").lower()
 
     structural_patterns = [
         "toctou", "crash-recovery", "crash recovery", "timing", "race condition",
@@ -2142,6 +2183,11 @@ def classify_poc_testability(bug_class: str, preferred_tag: str, title: str, sev
     if any(p in bc or p in title_lc for p in structural_patterns):
         if "map" in title_lc and ("iter" in title_lc or "order" in title_lc):
             return "property"
+        try:
+            if pipeline_lc == "l1" and _matches_l1_nondeterminism_class(bc, title_lc):
+                return "property"
+        except Exception:
+            pass
         return "structural"
 
     # VERIF-3: property/accounting/invariant bugs are multi-step and must be
@@ -2218,8 +2264,27 @@ def classify_poc_testability(bug_class: str, preferred_tag: str, title: str, sev
     return "structural"
 
 
+def _read_pipeline_from_config(scratchpad: Path) -> str:
+    """Read 'pipeline' from {scratchpad}/config.json. Returns '' if absent.
+
+    Mirrors plamen_validators._read_language_from_config. Try/except-safe:
+    any I/O/parse failure degrades to '' (== current, pre-existing behavior).
+    """
+    try:
+        import json as _json
+        cfg_path = scratchpad / "config.json"
+        if cfg_path.exists():
+            return _json.loads(
+                cfg_path.read_text(encoding="utf-8", errors="replace")
+            ).get("pipeline", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
 def _queue_rows_from_inventory_with_exclusions(
     scratchpad: Path,
+    pipeline: str = "",
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Convert inventory blocks into active and evidence-excluded queue rows.
 
@@ -2228,7 +2293,16 @@ def _queue_rows_from_inventory_with_exclusions(
     276 inventory IDs but the queue agent emitted only 20 rows plus a prose
     placeholder. This function makes promotion loss mechanically impossible by
     routing every parsed inventory block to exactly one route.
+
+    `pipeline` is OPTIONAL ("l1" or "sc"/""). When not supplied by the caller
+    (every existing caller today), it is auto-detected from
+    `{scratchpad}/config.json`'s "pipeline" field via `_read_pipeline_from_config`
+    — degrading to "" (== prior behavior, byte-identical for SC) if the file or
+    field is absent. This lets `classify_poc_testability` apply the L1-only
+    non-determinism/race/Byzantine reroute (see `_matches_l1_nondeterminism_class`)
+    without requiring every call site to be touched.
     """
+    resolved_pipeline = pipeline or _read_pipeline_from_config(scratchpad)
     inv_path = scratchpad / "findings_inventory.md"
     if not inv_path.exists():
         return [], []
@@ -2264,7 +2338,9 @@ def _queue_rows_from_inventory_with_exclusions(
         title_val = block.get("title", "") or fid
         bug_class_val = _strip_md(bug_class)
         preferred_tag_val = _strip_md(preferred).strip("[]") or "CODE-TRACE"
-        poc_class = classify_poc_testability(bug_class_val, preferred_tag_val, title_val, severity)
+        poc_class = classify_poc_testability(
+            bug_class_val, preferred_tag_val, title_val, severity, resolved_pipeline
+        )
         rows.append({
             "queue #": str(len(rows) + 1),
             "finding id": fid,

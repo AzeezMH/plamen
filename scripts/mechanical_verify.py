@@ -61,6 +61,18 @@ from supply_chain_gate import SupplyChainAbortError, gate_supply_chain
 
 # Per-file and per-phase budgets (overridable via env for ops scenarios).
 _DEFAULT_PER_TEST_TIMEOUT_S = int(os.environ.get("PLAMEN_MECH_VERIFY_TIMEOUT", "180"))
+# A1 (l1_go race-class routing): `go test -race` instruments every memory
+# access, costing ~2-20x execution time and ~5-10x memory versus a plain run
+# (https://go.dev/doc/articles/race_detector, https://go.dev/blog/race-detector).
+# A flat multiplier on the per-test timeout is a conservative middle ground —
+# enough headroom to absorb typical single-test-function overhead without
+# inflating every race-class row to the pathological 20x case (which would
+# blow the whole-phase budget when a queue has several race-class rows).
+# Ops-overridable; gated exclusively to l1_go rows whose verification_queue
+# Bug Class names a race/concurrency defect (see `_is_race_bug_class`).
+_RACE_TIMEOUT_MULTIPLIER = int(
+    os.environ.get("PLAMEN_MECH_VERIFY_RACE_TIMEOUT_MULTIPLIER", "3")
+)
 # One-time pre-warm compile budget (see _prewarm_build). Raised from 300s: a cold
 # `--via-ir` dependency-heavy repo cannot compile in the old budget, so the cache
 # never warmed and every PoC TIMEOUTed at [CODE-TRACE]. Default matches recon's build
@@ -89,6 +101,10 @@ class ExecResult:
     # Derived evidence tag the manifest recommends ([POC-PASS] / [POC-FAIL] /
     # preserve-existing). Driver decides whether to write back.
     recommended_tag: str = ""
+    # A1: True only for l1_go rows where the verification_queue Bug Class
+    # routed this run through `go test -race` with the raised timeout. Always
+    # False for every SC language and for non-race l1_go/l1_rust rows.
+    race_mode: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +158,20 @@ def _ensure_l1_registry_entries(reg: dict) -> None:
             "test_command": "go test -run {test_function} -v ./...",
             "test_filter_mode": "go_run_regex",
             "evidence_tags": ["POC-PASS", "POC-FAIL", "CODE-TRACE"],
-            "fuzz_engines": [],
+            # A3: template-registration only. `command`/`output_file` mirror the
+            # authoritative Go native-fuzz form documented in
+            # prompts/l1/v2/phase5-verification-prompt.md
+            # ("go test -fuzz Fuzz_{test_name} -fuzztime 5m ./..."). The fuzz
+            # re-run is NOT wired into the mechanical execution loop here —
+            # that is a deferred item with its own outcome vocabulary.
+            "fuzz_engines": [
+                {
+                    "name": "go_native_fuzz",
+                    "command": "go test -fuzz {test_function} -fuzztime 5m ./...",
+                    "template_path": "prompts/l1/phase4b-invariant-fuzz-go.md",
+                    "output_file": "go_fuzz_findings.md",
+                },
+            ],
         }
     if "l1_rust" not in langs:
         langs["l1_rust"] = {
@@ -152,7 +181,23 @@ def _ensure_l1_registry_entries(reg: dict) -> None:
             "test_prewarm_command": "cargo test --no-run",
             "features": [],
             "evidence_tags": ["POC-PASS", "POC-FAIL", "CODE-TRACE"],
-            "fuzz_engines": [],
+            # A3: template-registration only (see l1_go comment above). Commands
+            # mirror prompts/l1/v2/phase5-verification-prompt.md's documented
+            # preferred/fallback pair: cargo-fuzz (nightly, requires a target
+            # under fuzz/fuzz_targets/) with a proptest fallback on stable.
+            "fuzz_engines": [
+                {
+                    "name": "cargo_fuzz",
+                    "command": "cargo +nightly fuzz run fuzz_{test_function}",
+                    "template_path": "prompts/l1/phase4b-invariant-fuzz-rust.md",
+                    "output_file": "cargo_fuzz_findings.md",
+                },
+                {
+                    "name": "proptest",
+                    "command": "cargo test test_prop_{test_function} -- --nocapture",
+                    "output_file": "proptest_findings.md",
+                },
+            ],
         }
 
 
@@ -202,6 +247,99 @@ def _inject_cargo_exact(argv: list[str]) -> list[str]:
         i = argv.index("--")
         return argv[: i + 1] + ["--exact"] + argv[i + 1:]
     return argv + ["--", "--exact"]
+
+
+# ---------------------------------------------------------------------------
+# A1: l1_go `go test -race` routing (race/concurrency Bug-Class rows only)
+# ---------------------------------------------------------------------------
+
+# Mechanism-only vocabulary (Part 0: no protocol/codebase proper nouns) — the
+# same generic concurrency-defect terms `classify_poc_testability` in
+# plamen_parsers.py already recognizes as its `structural_patterns` race
+# family, so this gate rides the pipeline's existing bug-class vocabulary
+# instead of inventing a new one.
+_RACE_BUG_CLASS_KEYWORDS: tuple[str, ...] = (
+    "race", "concurrency", "concurrent", "data race", "goroutine leak",
+    "deadlock", "atomicity violation", "toctou",
+)
+
+
+def _is_race_bug_class(bug_class: str) -> bool:
+    """True when a verification_queue Bug Class names a race/concurrency defect.
+
+    Pure keyword match, case-insensitive substring — mirrors the tolerance
+    style already used for header-alias matching in plamen_parsers.py. Never
+    raises: a non-string or empty input simply returns False (safe default —
+    the finding runs the plain, already-tested `go test` command).
+    """
+    bc = (bug_class or "").lower()
+    return any(kw in bc for kw in _RACE_BUG_CLASS_KEYWORDS)
+
+
+def _inject_go_race_flag(argv: list[str]) -> list[str]:
+    """Insert `-race` right after the `test` subcommand token, once.
+
+    `go test -race -run ^Fn$ -v ./...` — race is a build/test flag that
+    `go help testflag` documents as combinable with `-run`; inserting it
+    immediately after the `test` token keeps the rendered command readable
+    and matches typical `go test -race` usage in Go docs/examples.
+    """
+    if "-race" in argv:
+        return argv
+    try:
+        i = argv.index("test")
+    except ValueError:
+        return argv + ["-race"]
+    return argv[: i + 1] + ["-race"] + argv[i + 1:]
+
+
+def _parsers_module():
+    """Lazy-import plamen_parsers (read-only reuse, never modified here).
+
+    Only reached for l1_go's race-class gate (`_load_race_bug_class_map`):
+    reuses `parse_verification_queue_rows`, the same canonical reader the
+    rest of the pipeline uses for `verification_queue.md` (JSON-sidecar
+    preferred, markdown-table fallback). Isolated as its own lazy import
+    (mirrors `_spike_module()`) so the SC languages' import graph is
+    completely unaffected — this module is only ever touched when
+    language == "l1_go".
+    """
+    import importlib
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    return importlib.import_module("plamen_parsers")
+
+
+def _load_race_bug_class_map(scratchpad: Path, lang: str) -> dict[str, str]:
+    """Best-effort `finding_id -> Bug Class` lookup, gated to l1_go only.
+
+    SC ISOLATION: returns `{}` immediately for every language other than
+    `l1_go` — no plamen_parsers import, no verification_queue read, so the
+    SC verify path (evm/solana/aptos/sui/soroban/daml) and non-race l1_go/
+    l1_rust rows are byte-identical to before this function existed.
+
+    HALTLESS: never raises. A missing scratchpad, missing
+    verification_queue.md, or any parser failure degrades to an empty map —
+    which simply means no row gets the `-race` treatment (the existing,
+    already-tested plain `go test` command runs instead).
+    """
+    if lang != "l1_go":
+        return {}
+    try:
+        parsers = _parsers_module()
+        rows = parsers.parse_verification_queue_rows(Path(scratchpad))
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    try:
+        for row in rows or []:
+            fid = str(row.get("finding id", "") or "").strip().upper()
+            bc = str(row.get("bug class", "") or "").strip()
+            if fid:
+                out[fid] = bc
+    except Exception:
+        return {}
+    return out
 
 
 def _format_test_command(template: str, test_function: str,
@@ -863,7 +1001,8 @@ def _classify_evm_outcome(rc: int, stdout: str, isolated: bool = True) -> str:
 
 def _run_test_for_finding(verify_path: Path, build_root: Path, language: str,
                           registry: dict, per_test_timeout_s: int,
-                          project_root: Optional[Path] = None) -> ExecResult:
+                          project_root: Optional[Path] = None,
+                          bug_class_map: Optional[dict[str, str]] = None) -> ExecResult:
     """Execute one verify file's PoC and classify the outcome."""
     spike = _spike_module()
     probe = spike.parse_verify_file(verify_path, language=language)
@@ -970,6 +1109,29 @@ def _run_test_for_finding(verify_path: Path, build_root: Path, language: str,
         cmd = _apply_cargo_workspace_fixups(
             cmd, probe, language=language, resolved=resolved, build_root=build_root)
 
+    # A1: l1_go race/concurrency Bug-Class rows get `-race` + a raised
+    # per-test timeout. Strictly gated: only fires when language == "l1_go"
+    # AND the row's Bug Class (from verification_queue.md) matches the race
+    # keyword set. Every other language, and every non-race l1_go/l1_rust
+    # row, falls through with `effective_timeout_s == per_test_timeout_s`
+    # and `race_env is None` (subprocess inherits the parent env exactly as
+    # before this change).
+    effective_timeout_s = per_test_timeout_s
+    race_env: Optional[dict[str, str]] = None
+    if language == "l1_go":
+        bug_class = (bug_class_map or {}).get((probe.finding_id or "").strip().upper(), "")
+        if _is_race_bug_class(bug_class):
+            cmd = _inject_go_race_flag(cmd)
+            effective_timeout_s = per_test_timeout_s * _RACE_TIMEOUT_MULTIPLIER
+            result.race_mode = True
+            # `-race` requires cgo enabled (and a C compiler on non-Darwin
+            # hosts) — https://go.dev/doc/articles/race_detector. Force
+            # CGO_ENABLED=1 for this one subprocess so a CGO_ENABLED=0
+            # host/CI default can't silently turn `-race` into a build
+            # failure or a no-op non-race binary.
+            race_env = os.environ.copy()
+            race_env["CGO_ENABLED"] = "1"
+
     # Resolve binary path (handles Windows .cmd / .exe shims)
     bin_path = shutil.which(cmd[0])
     if bin_path:
@@ -984,8 +1146,9 @@ def _run_test_for_finding(verify_path: Path, build_root: Path, language: str,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=per_test_timeout_s,
+            timeout=effective_timeout_s,
             shell=False,
+            env=race_env,
         )
         result.duration_s = time.time() - t0
         result.test_command_used = " ".join(cmd)
@@ -993,9 +1156,9 @@ def _run_test_for_finding(verify_path: Path, build_root: Path, language: str,
         result.stdout_tail = stdout[-3000:]
         result.status = _classify_non_evm_outcome(language, proc.returncode, stdout)
     except subprocess.TimeoutExpired:
-        result.duration_s = float(per_test_timeout_s)
+        result.duration_s = float(effective_timeout_s)
         result.status = "TIMEOUT"
-        result.stdout_tail = f"test execution exceeded {per_test_timeout_s}s"
+        result.stdout_tail = f"test execution exceeded {effective_timeout_s}s"
     except Exception as exc:
         result.duration_s = time.time() - t0
         result.status = "EXEC_ERROR"
@@ -1772,6 +1935,10 @@ def run_phase5b_mechanical_verify(scratchpad: Path, project_root: Path,
     prewarm_ok, prewarm_note = _prewarm_build(
         build_root, lang, registry, _DEFAULT_BUILD_TIMEOUT_S)
 
+    # A1: l1_go-only best-effort Bug-Class lookup for `-race` routing. `{}`
+    # for every SC language and for l1_rust — see `_load_race_bug_class_map`.
+    race_bug_class_map = _load_race_bug_class_map(scratchpad, lang)
+
     results: list[ExecResult] = []
     annotated = 0
     t_start = time.time()
@@ -1788,6 +1955,7 @@ def run_phase5b_mechanical_verify(scratchpad: Path, project_root: Path,
         r = _run_test_for_finding(
             vf, build_root, lang, registry, per_test_timeout_s,
             project_root=Path(project_root),
+            bug_class_map=race_bug_class_map,
         )
         r.recommended_tag = _recommended_tag(r.status)
         if _annotate_verify_file(vf, r):
@@ -1822,4 +1990,8 @@ __all__ = [
     "_recommended_tag",
     "flip_verdict_on_integrity_downgrade",
     "read_verdict_manifest",
+    "_is_race_bug_class",
+    "_inject_go_race_flag",
+    "_load_race_bug_class_map",
+    "_RACE_TIMEOUT_MULTIPLIER",
 ]
