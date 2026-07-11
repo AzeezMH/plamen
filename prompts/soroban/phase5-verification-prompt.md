@@ -85,6 +85,28 @@ Follow `phase5-poc-execution.md`. Compile and run every PoC - a written test wit
 - Fuzz: `cargo +nightly fuzz run <target>` (only if nightly toolchain installed); on macOS use `cargo +nightly fuzz run --sanitizer=thread <target>` to avoid AddressSanitizer linking errors (see rs-soroban-sdk#1056); fall back to proptest with bounded inputs or boundary-value parameterized tests
 - See PoC framework section below for test structure.
 
+### PoC File Placement (MANDATORY — in-crate authoring)
+
+Author the PoC as a **NEW in-crate file** `src/poc_{hypothesis_id}.rs` inside
+the target workspace member, wired in via `#[cfg(test)] mod poc_{hypothesis_id};`
+added to that member's `lib.rs`. Record in the PoC Attempt Ledger:
+- **Test File**: `<crate>/src/poc_{hypothesis_id}.rs`
+- **Command**: `cargo test -p <crate> --features testutils {fn}`
+
+**FORBIDDEN shapes** (do not use as the PoC's primary authoring location):
+- Writing the test body directly inline into `lib.rs` — a `Test File: lib.rs`
+  entry is an excluded basename and is not a valid PoC location.
+- A bare top-level `tests/*.rs` integration test as the PRIMARY PoC shape.
+
+**Why (generic — no protocol/crate names)**: a crate declaring only
+`crate-type = ["cdylib"]` has no `rlib` target, so a `tests/*.rs` integration
+test — which links against the crate as an external dependency — can fail to
+link (an E0463-class "can't find crate" error) because there is no rlib to
+link against. An in-crate `#[cfg(test)] mod` compiles as part of the crate's
+own `rustc --test` compilation unit, so it builds and runs regardless of
+`crate-type`. This is a structural build-shape fact, not a per-project
+exception, so the in-crate mandate applies uniformly.
+
 ### PoC Attempt Ledger (MANDATORY)
 
 Every verifier output for this finding MUST include this ledger BEFORE
@@ -510,6 +532,24 @@ HOW-directive about picking a *breakable* invariant; it names no protocol, token
 or function (a native↔wrapped conversion is only an illustrative example of a
 boundary where `CONSERVATION` looks satisfied yet `REQUESTED_EQ_DELIVERED` can
 still diverge). Symbols always resolve at the locus at runtime.
+
+## INDEPENDENT SEVERITY ASSESSMENT (MANDATORY — M4 anti-inflation)
+
+Before reconciling with any pre-assigned/claimed severity (from the hypothesis, queue, or inventory), assess a severity INDEPENDENTLY:
+
+1. Read ONLY the code and your own evidence (PoC result, code trace, dual-perspective verdict from above). Deliberately IGNORE the claimed/pre-assigned severity for this step - do not let it anchor your judgment.
+2. Apply the standard severity matrix (Impact x Likelihood) from `~/.claude/rules/report-template.md` to what YOU found, as if no severity had been pre-assigned.
+3. Record the result in your output BEFORE finalizing your Severity field:
+
+```
+**Independent Severity**: <Critical|High|Medium|Low|Informational|N/A>
+```
+
+- Assessed from the code and evidence ALONE; ignore any pre-assigned severity.
+- Use `N/A` ONLY when your verdict is REFUTED/FALSE_POSITIVE (no independent severity applies to a non-finding).
+- This field is MANDATORY for every non-REFUTED verdict. The driver reads it to mechanically compute `final = min(Independent Severity, claimed severity)` - this can ONLY LOWER the reported severity, it NEVER raises it and NEVER drops the finding. A missing or unparseable field is recall-safe: it simply falls back to the claimed severity (no cap applied).
+
+Do NOT skip this field to save time, and do NOT default it to the claimed severity - that defeats its purpose of catching an inflated pre-assigned severity.
 
 ## FIX GENERATION (POC-PASS only)
 If your PoC PASSES (verdict = CONFIRMED with [POC-PASS]):

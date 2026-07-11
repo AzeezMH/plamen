@@ -23,6 +23,8 @@
       "build_command": "cargo build-sbf",
       "test_command": "cargo test test_{id} -- --nocapture",
       "test_filter_mode": "cargo_name_filter",
+      "test_prewarm_command": "cargo test --no-run",
+      "features": [],
       "fuzz_engines": [
         {
           "name": "trident",
@@ -75,6 +77,8 @@
       "build_command": "stellar contract build",
       "test_command": "cargo test --features testutils test_{id}",
       "test_filter_mode": "cargo_name_filter",
+      "test_prewarm_command": "cargo test --no-run",
+      "features": ["testutils"],
       "fuzz_engines": [
         {
           "name": "cargo_fuzz",

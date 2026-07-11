@@ -5316,6 +5316,12 @@ _REPORT_DEDUP_CANDIDATE_CAP = 50
 # pairs on a dense report (per a dense-report precision post-mortem).
 _REPORT_DEDUP_LINE_TOLERANCE = 3
 
+# Fix 1 (item C): same-tier title-overlap threshold. Mirrors the threshold
+# already used by the sibling inventory-level candidate builder
+# (`_compute_dedup_candidate_pairs` Signal 2) for consistency — same-tier
+# pairs below this score fall through to the shared-identifier signal instead.
+_REPORT_DEDUP_TITLE_SCORE = 0.50
+
 
 def _report_index_first_location(cell: str) -> tuple[str, tuple[int, int] | None]:
     """Extract (basename, first-line-range) from a Master Finding Index Location cell.
@@ -5397,27 +5403,45 @@ def _parse_report_index_master_rows(text: str) -> list[dict]:
 
 
 def _compute_report_dedup_candidate_pairs(scratchpad: Path) -> int:
-    """Emit report_dedup_candidate_pairs.md — cross-tier same-location HINTS.
+    """Emit report_dedup_candidate_pairs.md — same-tier AND cross-tier HINTS.
 
-    Fix 4: read ``report_index.md``'s Master Finding Index and list every
-    CROSS-TIER pair (report-ID prefix differs, e.g. High↔Medium) whose FIRST
-    Location range matches within ±3 lines on BOTH endpoints on the same file
-    basename. A precision post-mortem showed the mechanical report_dedup pass has no
-    candidate list, so the H-01/M-06 identical-location twin (a High and a
-    Medium describing the same permissionless ``withdraw`` at the same lines)
-    never reached the LLM proposer.
+    Fix 4 (cross-tier): read ``report_index.md``'s Master Finding Index and
+    list every CROSS-TIER pair (report-ID prefix differs, e.g. High↔Medium)
+    whose FIRST Location range matches within ±3 lines on BOTH endpoints on
+    the same file basename. A precision post-mortem showed the mechanical
+    report_dedup pass has no candidate list, so the H-01/M-06 identical-
+    location twin (a High and a Medium describing the same permissionless
+    ``withdraw`` at the same lines) never reached the LLM proposer.
+
+    Fix 1 (item C, same-tier): the near-identical-location signal above now
+    fires for SAME-TIER pairs too (the `if fa["tier"] == fb["tier"]: continue`
+    skip that previously gated it out is removed). Same-tier pairs ALSO get
+    two additional signals the sibling inventory-level candidate builder
+    (`_compute_dedup_candidate_pairs`) already uses: title similarity
+    (``_titles_overlap_score`` >= 0.50) and a shared specific identifier in
+    the title (``_shared_anchor_tokens`` — e.g. a shared function/struct
+    name), so two same-tier findings describing the same bug from different
+    lines/wording still surface as a candidate. These two signals are scoped
+    to SAME-TIER pairs only — cross-tier candidate generation is UNCHANGED
+    (location-range only), preserving prior cross-tier behavior exactly.
+    Without this, same-tier duplicate merging depended on the LLM doing
+    unaided exhaustive pairwise comparison with no candidate scaffolding,
+    which does not scale on a dense report (~10 surviving same-tier clusters
+    observed on a real report).
 
     CANDIDATE-ONLY. This helper NEVER merges anything. The report_dedup_agent's
     same-root-cause + same-fix + describable-together test remains the SOLE merge
     authority, and the Python executor's zero-loss embed + data-loss gate is the
     final safety net. Distinct-mechanism findings that happen to sit at the same
-    lines (e.g. two different bugs in one function) surface here purely as
+    lines, or that merely share a title word/identifier, surface here purely as
     candidates for the LLM to VETO.
 
-    Guards left UNCHANGED per Fix 4: the report_dedup decision tree's
+    Guards left UNCHANGED per Fix 4 / Fix 1: the report_dedup decision tree's
     anti-transitive / survivor-superset guard, the live-pair cap, and the
-    Phase-4e never-cross-tier policy. This helper adds a bounded (±3, ≤50)
-    candidate list only.
+    Phase-4e never-cross-tier policy (unaffected — that policy governs a
+    different phase's clustering, not this hint list). This helper adds a
+    bounded (≤50) candidate list only; it never edits report_index.md or any
+    merge/mapping artifact.
 
     Returns the number of candidate pairs written.
     """
@@ -5439,27 +5463,49 @@ def _compute_report_dedup_candidate_pairs(scratchpad: Path) -> int:
             continue
         findings.append({**r, "_file": base, "_lines": lr})
 
-    # Group by file basename; pair cross-tier findings with near-identical first
-    # ranges (both endpoints within ±3).
+    # Group by file basename; pair findings on the SAME file only.
     by_file: dict[str, list[int]] = {}
     for i, f in enumerate(findings):
         by_file.setdefault(f["_file"], []).append(i)
 
     tol = _REPORT_DEDUP_LINE_TOLERANCE
+    title_thresh = _REPORT_DEDUP_TITLE_SCORE
     pairs: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for _file, indices in by_file.items():
         for a in range(len(indices)):
             for b in range(a + 1, len(indices)):
                 fa, fb = findings[indices[a]], findings[indices[b]]
-                if fa["tier"] == fb["tier"]:
-                    continue  # cross-tier only
+                same_tier = fa["tier"] == fb["tier"]
                 sa, ea = fa["_lines"]
                 sb, eb = fb["_lines"]
                 dstart = abs(sa - sb)
                 dend = abs(ea - eb)
-                if dstart > tol or dend > tol:
+
+                signal = ""
+                detail = ""
+                if dstart <= tol and dend <= tol:
+                    # Near-identical location: fires for ANY tier pairing
+                    # (Fix 1 — previously cross-tier only).
+                    signal = "location"
+                    detail = f"±{dstart}/±{dend} lines"
+                elif same_tier:
+                    # Fix 1: same-tier-only fallback signals when the
+                    # locations are NOT near-identical. Cross-tier candidate
+                    # generation is unchanged (location-only, see docstring).
+                    score = _titles_overlap_score(fa["title"], fb["title"])
+                    if score >= title_thresh:
+                        signal = "title"
+                        detail = f"title overlap {score:.2f}"
+                    else:
+                        anchors = _shared_anchor_tokens(fa["title"], fb["title"])
+                        if anchors:
+                            signal = "anchor"
+                            detail = f"shared identifier: {', '.join(sorted(anchors))}"
+
+                if not signal:
                     continue
+
                 key = tuple(sorted((fa["report_id"], fb["report_id"])))
                 if key in seen:
                     continue
@@ -5474,11 +5520,20 @@ def _compute_report_dedup_candidate_pairs(scratchpad: Path) -> int:
                     "a": fa, "b": fb,
                     "file": _file,
                     "loc_a": (sa, ea), "loc_b": (sb, eb),
-                    "dstart": abs(sa - sb), "dend": abs(ea - eb),
+                    "dstart": dstart, "dend": dend,
+                    "same_tier": same_tier,
+                    "signal": signal, "detail": detail,
                 })
 
-    # Deterministic ordering: tightest match first, then report ID.
-    pairs.sort(key=lambda p: (p["dstart"] + p["dend"], p["a"]["report_id"], p["b"]["report_id"]))
+    # Deterministic ordering: location-signal pairs first (tightest match
+    # first), then title/anchor pairs, then report ID — keeps the strongest,
+    # most mechanically-certain hints at the top of the bounded live set.
+    _signal_rank = {"location": 0, "title": 1, "anchor": 2}
+    pairs.sort(key=lambda p: (
+        _signal_rank.get(p["signal"], 9),
+        p["dstart"] + p["dend"],
+        p["a"]["report_id"], p["b"]["report_id"],
+    ))
 
     n_total = len(pairs)
     truncated = n_total > _REPORT_DEDUP_CANDIDATE_CAP
@@ -5487,7 +5542,7 @@ def _compute_report_dedup_candidate_pairs(scratchpad: Path) -> int:
     out = ["# Report Dedup Candidate Pairs", ""]
     if not live:
         out.append(
-            "No cross-tier same-location candidate pairs found. The "
+            "No same-tier or cross-tier candidate pairs found. The "
             "report_dedup_agent still runs its own semantic pass."
         )
         (scratchpad / "report_dedup_candidate_pairs.md").write_text(
@@ -5496,41 +5551,46 @@ def _compute_report_dedup_candidate_pairs(scratchpad: Path) -> int:
         return 0
 
     out.append(
-        f"{len(live)} cross-tier candidate pair(s): findings on the SAME file "
-        f"whose FIRST Location range matches within ±{tol} lines on both "
-        "endpoints."
+        f"{len(live)} candidate pair(s): findings on the SAME file that either "
+        f"(a) have a FIRST Location range matching within ±{tol} lines on both "
+        "endpoints (any tier pairing), or (b) are SAME-TIER with overlapping "
+        f"title wording (title overlap >= {title_thresh:.2f}) or a shared "
+        "specific identifier (e.g. a function/struct name) in the title."
     )
     out.append("")
     out.append(
         "**CANDIDATE HINTS ONLY.** This list does NOT merge anything. Apply the "
         "consolidation test (same root cause + same fix + describable together) "
-        "to BOTH full finding bodies before proposing a MERGE — same lines is a "
-        "coincidence signal, not proof. Two DISTINCT bugs at the same location "
-        "(different mechanism / different fix) MUST be kept separate. When in "
-        "doubt, KEEP SEPARATE."
+        "to BOTH full finding bodies before proposing a MERGE — a matching "
+        "location, similar title, or shared identifier is a coincidence signal, "
+        "not proof. Two DISTINCT bugs that happen to trip a signal (e.g. two "
+        "different bugs in one function, or two findings that merely name the "
+        "same function) MUST be kept separate. When in doubt, KEEP SEPARATE."
     )
     if truncated:
         out.append("")
         out.append(
-            f"NOTE: {n_total} candidate pair(s) found; showing the tightest "
+            f"NOTE: {n_total} candidate pair(s) found; showing the strongest "
             f"{_REPORT_DEDUP_CANDIDATE_CAP}. Remaining pairs are deferred (not "
             "discarded) — the agent may still merge them on its own semantic pass."
         )
     out.append("")
     out.append(
-        "| Survivor (higher sev) | Absorbed candidate | File | Loc A | Loc B | Δstart | Δend |"
+        "| Survivor (higher sev) | Absorbed candidate | Tier | File | Loc A | Loc B | Signal |"
     )
     out.append(
-        "|-----------------------|--------------------|------|-------|-------|--------|------|"
+        "|-----------------------|--------------------|------|------|-------|-------|--------|"
     )
     for p in live:
         a, b = p["a"], p["b"]
         la, ea = p["loc_a"]
         lb, eb = p["loc_b"]
+        tier_label = "same-tier" if p["same_tier"] else "cross-tier"
         out.append(
             f"| {a['report_id']}: {a['title'][:44]} "
             f"| {b['report_id']}: {b['title'][:44]} "
-            f"| {p['file']} | L{la}-{ea} | L{lb}-{eb} | {p['dstart']} | {p['dend']} |"
+            f"| {tier_label} | {p['file']} | L{la}-{ea} | L{lb}-{eb} "
+            f"| {p['signal']} ({p['detail']}) |"
         )
     out.append("")
     (scratchpad / "report_dedup_candidate_pairs.md").write_text(

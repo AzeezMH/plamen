@@ -4427,6 +4427,74 @@ def _parse_report_dedup_agent_decisions(
     return merge_pairs, qo_ids
 
 
+def _report_dedup_candidate_pairs_from_hint(scratchpad: Path) -> list[tuple[str, str]]:
+    """Extract the (report_id_A, report_id_B) pairs from the driver-computed
+    ``report_dedup_candidate_pairs.md`` HINT file (C Fix 1 output). The first two
+    cells of each data row are ``<ID>: <title>`` — pull the leading report ID of
+    each. Returns [] on any absence/parse failure (advisory only)."""
+    path = scratchpad / "report_dedup_candidate_pairs.md"
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    pairs: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("|") or _is_separator_row(s):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        ma = _REPORT_DEDUP_AGENT_ID_RE.search(cells[0])
+        mb = _REPORT_DEDUP_AGENT_ID_RE.search(cells[1])
+        if not ma or not mb:
+            continue  # header/prose rows carry no leading IDs in the first 2 cells
+        a, b = ma.group(1).upper(), mb.group(1).upper()
+        if a != b:
+            pairs.append(tuple(sorted((a, b))))  # type: ignore[arg-type]
+    # de-dup while preserving order
+    seen: set[tuple[str, str]] = set()
+    out: list[tuple[str, str]] = []
+    for p in pairs:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _report_dedup_coverage_gaps(scratchpad: Path) -> list[tuple[str, str]]:
+    """C Fix 2 (coverage receipt): return the driver-computed candidate pairs
+    that the report_dedup_agent did NOT explicitly dispose.
+
+    A candidate pair (X, Y) is COVERED when BOTH IDs appear somewhere in
+    ``report_dedup_agent_decisions.md`` (any table: MERGE, Quality Observation,
+    or Reviewed — Kept Separate) — i.e. the agent looked at both findings and
+    recorded a verdict. An UNCOVERED pair is one the agent silently skipped: the
+    C-Fix-1 hint surfaced it but no KEEP/MERGE disposition exists.
+
+    VISIBILITY ONLY — this never merges, never drops, never changes severity. It
+    exists so a silently-skipped duplicate is logged for the operator instead of
+    vanishing (recall/precision honesty; recall-safe by construction). Returns []
+    when either file is absent (advisory)."""
+    candidates = _report_dedup_candidate_pairs_from_hint(scratchpad)
+    if not candidates:
+        return []
+    decisions_path = scratchpad / "report_dedup_agent_decisions.md"
+    if not decisions_path.exists():
+        return list(candidates)  # nothing disposed → every candidate is a gap
+    try:
+        dtext = decisions_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    disposed_ids = {m.group(1).upper() for m in _REPORT_DEDUP_AGENT_ID_RE.finditer(dtext)}
+    return [
+        (a, b) for (a, b) in candidates
+        if a not in disposed_ids or b not in disposed_ids
+    ]
+
+
 def _dedup_report_python(scratchpad: Path, project_root: str) -> bool:
     """Cross-tier report dedup. Python-native, NEVER loses content.
 
@@ -4488,6 +4556,20 @@ def _dedup_report_python(scratchpad: Path, project_root: str) -> bool:
     except Exception as exc:
         log.warning(f"[report_dedup] agent decisions parse failed: {exc!r} — ignored")
         agent_merge_pairs, agent_qo_ids = [], set()
+
+    # C Fix 2 (coverage receipt): surface any driver-computed candidate pair the
+    # agent did not explicitly dispose. VISIBILITY ONLY — never merges/drops; a
+    # silently-skipped duplicate is logged instead of vanishing (recall-safe).
+    try:
+        _cov_gaps = _report_dedup_coverage_gaps(scratchpad)
+        if _cov_gaps:
+            log.warning(
+                f"[report_dedup] {len(_cov_gaps)} candidate pair(s) had no "
+                f"explicit MERGE/Kept-Separate disposition (left un-merged): "
+                + ", ".join(f"{a}~{b}" for a, b in _cov_gaps[:20])
+            )
+    except Exception as exc:
+        log.warning(f"[report_dedup] coverage-gap check failed: {exc!r} — ignored")
 
     qo_rows: list[tuple[str, str, str, str, str, str]] = []
     working = original
@@ -9815,7 +9897,52 @@ def estimate_rate_limit_wait_seconds(stdio_log: Path) -> Optional[int]:
             except Exception:
                 pass
 
-    m = re.search(r"(?i)resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", tail)
+    # Absolute reset timestamp WITH a date. Codex/ChatGPT daily usage caps phrase
+    # the reset as an absolute wall-clock time hours out, e.g.
+    #   "... or try again at Jul 11th, 2026 2:46 AM."
+    # This is neither a "retry-after N" delta nor the "resets HH:MM am/pm" form,
+    # so without this branch the estimator returned None and the caller fell back
+    # to a pointless 5-minute spin-wait before a retry that re-hits the same cap.
+    _MONTHS = {
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
+    m = re.search(
+        r"(?i)(?:try again|reset[s]?|available again)\s+(?:at|on)\s+"
+        r"([a-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})[,\s]+"
+        r"(\d{1,2}):(\d{2})\s*(am|pm)\b",
+        tail,
+    )
+    if m:
+        try:
+            mon = _MONTHS.get(m.group(1)[:3].lower())
+            if mon:
+                day = int(m.group(2))
+                year = int(m.group(3))
+                hour = int(m.group(4))
+                minute = int(m.group(5))
+                if hour == 12:
+                    hour = 0
+                if m.group(6).lower() == "pm":
+                    hour += 12
+                now = datetime.now().astimezone()
+                target = now.replace(
+                    year=year, month=mon, day=day,
+                    hour=hour, minute=minute, second=0, microsecond=0,
+                )
+                delta = int((target - now).total_seconds())
+                if delta > 0:
+                    return delta
+        except Exception:
+            pass
+
+    # Absolute reset time WITHOUT a date: "resets 5:46 PM", "resets at 5:46 PM",
+    # or the Codex time-only variant "try again at 5:46 PM".
+    m = re.search(
+        r"(?i)(?:try again\s+at|resets?(?:\s+at)?|available again\s+at)\s+"
+        r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+        tail,
+    )
     if m:
         try:
             hour = int(m.group(1))

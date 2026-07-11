@@ -32,6 +32,7 @@ from plamen_types import (
     canonical_verification_status,
     FINDING_BLOCK_HEADING_RE,
     normalize_severity,
+    try_normalize_severity,
     plamen_home,
 )
 from plamen_parsers import *  # noqa: F403,F401
@@ -256,6 +257,8 @@ __all__ = [
     "_find_verify_file",
     "_validate_poc_attempt_coverage",
     "_apply_poc_fail_demotions",
+    "_apply_independent_severity_caps",
+    "_load_independent_severity_caps",
     "_append_crossbatch_coverage_ledger",
     "_validate_report_coverage_accounting",
     "_validate_poc_pass_integrity",
@@ -16103,6 +16106,65 @@ def _is_harness_location_prose(location: str) -> bool:
     return bool(_HARNESS_PROSE_RE.search(loc))
 
 
+# Gate 3 — identifier-existence hallucination catch. A finding may cite a
+# CONCRETE code identifier (a function/method name) that simply does not exist
+# anywhere in the codebase — a stronger anti-hallucination signal than the
+# path-based location gates above, which only check the *file*, not the
+# *symbol* inside it. Deliberately narrow extraction: only patterns that are
+# "clearly a function" trigger (backtick-quoted `foo()` / `Contract.method`,
+# a `function fooBar` prose token, or a bare `fooBar()` call token). Plain
+# prose ("the setter", "withdraw path") and bare variable names in backticks
+# (no dot, no parens) never match, by design -> treated as NO concrete
+# identifier, per the recall-safe skip requirement.
+_IDENTIFIER_PATTERNS = (
+    re.compile(r"`([A-Za-z_][A-Za-z0-9_]*)\(\)`"),
+    re.compile(r"`([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*)\(?\)?`"),
+    re.compile(r"(?i)\bfunction\s+([A-Za-z_][A-Za-z0-9_]{2,})\b"),
+    re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\(\)"),
+)
+
+
+def _extract_concrete_identifier(title: str, location: str = "") -> str | None:
+    """Extract a single, unambiguous concrete function/method identifier cited
+    in a finding's title/location. Returns the bare symbol name (dotted
+    `Contract.method` forms are reduced to `method`), or None when zero or
+    2+ distinct identifiers are cited (ambiguous -> skip, recall-safe)."""
+    text = f"{title or ''} {location or ''}"
+    candidates: list[str] = []
+    for pat in _IDENTIFIER_PATTERNS:
+        for m in pat.finditer(text):
+            ident = m.group(1)
+            candidates.append(ident.rsplit(".", 1)[-1])
+    if not candidates:
+        return None
+    uniq = sorted(set(candidates))
+    if len(uniq) != 1:
+        return None
+    return uniq[0]
+
+
+def _identifier_exists_in_project(identifier: str, source_index: dict[str, list]) -> bool:
+    """Whole-scope check: does `identifier` occur (word-boundary) in ANY file
+    of the project source index? Deliberately ignores which file the finding
+    resolved to -> inheritance/imports/wrong-file resolution never trip this."""
+    if not identifier:
+        return False
+    pattern = re.compile(r"\b" + re.escape(identifier) + r"\b")
+    seen: set = set()
+    for paths in source_index.values():
+        for p in paths:
+            if p in seen:
+                continue
+            seen.add(p)
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            if pattern.search(content):
+                return True
+    return False
+
+
 def _validate_inventory_evidence(
     scratchpad: Path,
     project_root: str,
@@ -16141,6 +16203,36 @@ def _validate_inventory_evidence(
             # -> the finding is about non-audited test code, not production.
             loc_status = "LOCATION_NONPRODUCTION"
             loc_reason = "finding is about the test/fuzz/invariant harness, not production code"
+        # Gate 3 — identifier-existence hallucination catch: a finding citing a
+        # CONCRETE function/method identifier that is absent from the ENTIRE
+        # project source index (not merely the resolved file — inheritance,
+        # imports, and wrong-file resolution never trip this) is very likely a
+        # hallucinated reference. RECALL-SAFE: only Low/Informational findings
+        # are appendix-routed; Medium/High/Critical are flagged for human
+        # review only and stay exactly where they were (never appendix-routed,
+        # never dropped). Never raises: any parse error leaves loc_status as-is.
+        try:
+            ident = _extract_concrete_identifier(item.get("title", ""), item.get("location", ""))
+            if ident and not _identifier_exists_in_project(ident, source_index):
+                severity = normalize_severity(
+                    _field_from_markdown(item.get("block", ""), ("Severity", "Final Severity"))
+                )
+                if severity in ("Low", "Informational"):
+                    if loc_status in ("OK", "RECOVERED_BASENAME"):
+                        loc_status = "IDENTIFIER_UNVERIFIED"
+                        loc_reason = (
+                            f"cited identifier `{ident}` not found anywhere in the "
+                            "project source index (likely hallucinated)"
+                        )
+                else:
+                    # Medium/High/Critical: flag only, never appendix-route.
+                    flag = (
+                        f"[IDENTIFIER-UNVERIFIED — human review: `{ident}` not "
+                        "found anywhere in the project source index]"
+                    )
+                    loc_reason = f"{loc_reason} {flag}".strip() if loc_reason else flag
+        except Exception:
+            pass
         source_tokens = _split_source_id_tokens(item.get("source_ids", ""))
         source_statuses = []
         source_reasons = []
@@ -16232,15 +16324,19 @@ def _filter_verification_queue_by_evidence(scratchpad: Path) -> list[str]:
 
     Two drop policies:
       - HARD (location ground truth, drop on its own): the cited file genuinely
-        does not exist, the cited line exceeds the file length, or the location
-        resolved to a non-production (test/fuzz/mock/harness) path. These are
-        mechanical facts, not judgment — a finding citing absent/non-production
-        code is not an in-scope production vulnerability.
+        does not exist, the cited line exceeds the file length, the location
+        resolved to a non-production (test/fuzz/mock/harness) path, or (Low/
+        Informational only — Gate 3) the finding cites a concrete function/
+        method identifier absent from the ENTIRE project source index. These
+        are mechanical facts, not judgment — a finding citing absent/non-
+        production/hallucinated code is not an in-scope production
+        vulnerability. Medium+ findings are NEVER hard-dropped by Gate 3 (see
+        `_validate_inventory_evidence` — they are flagged, not appendix-routed).
       - CONSERVATIVE (both-bad): only suppress when BOTH location and provenance
         are unresolved/invalid. A merely unparseable/prose location with a usable
         Source ID still proceeds to verifier/location recovery.
     All removals are written to verification_queue_evidence_excluded.md (ledger,
-    not a silent drop).
+    not a silent drop — this is an appendix routing, not a body deletion).
     """
     records = _parse_inventory_evidence_validation(scratchpad)
     if not records:
@@ -16271,10 +16367,15 @@ def _filter_verification_queue_by_evidence(scratchpad: Path) -> list[str]:
         # hallucinated-location case observed in practice is a DOWNSTREAM (report
         # tier-writer) corruption that overwrites the validated report_index
         # location — that is caught at report-assembly, not here.
-        loc_hard_invalid = (loc_status_val == "LOCATION_NONPRODUCTION")
+        loc_hard_invalid = loc_status_val in ("LOCATION_NONPRODUCTION", "IDENTIFIER_UNVERIFIED")
         if loc_hard_invalid or (loc_bad and src_bad):
             row = dict(row)
-            if loc_hard_invalid:
+            if loc_status_val == "IDENTIFIER_UNVERIFIED":
+                row["exclusion reason"] = (
+                    "Unverified identifier (appendix, not dropped): "
+                    f"{rec.get('location reason') or 'cited identifier not found anywhere in the project source index'}"
+                )
+            elif loc_hard_invalid:
                 row["exclusion reason"] = (
                     f"Out-of-scope location ({loc_status_val}): "
                     f"{rec.get('location reason') or 'cited code is not an in-scope production file'}"
@@ -17155,7 +17256,12 @@ def _report_index_adjustment_reason_present(*values: str) -> bool:
         # new alternative is needed. A canonical Verification word (CONFIRMED /
         # VERIFIED / UNVERIFIED) is deliberately NOT added: it is a STATUS, not a
         # severity-change REASON, and must never excuse a silent severity delta.
-        r"structural|untestable",
+        r"structural|untestable|"
+        # M4: INDEPENDENT-MIN(<claimed>) is the Trust Adj. token for the
+        # blind-first independent-severity cap (mirrors EXTERNAL-ASSUMPTION-
+        # CAP's registration above). The token itself does not contain "cap"
+        # as a substring, so "independent" must be its own alternative.
+        r"independent",
         text,
         re.IGNORECASE,
     ))
@@ -17464,6 +17570,7 @@ def _egress_rpc_reachable(scratchpad: Path) -> bool:
 
 def _expected_report_index_severities(scratchpad: Path) -> dict[str, str]:
     caps = _poc_demotion_caps_for_validator(scratchpad)
+    independent_caps = _load_independent_severity_caps(scratchpad)
     proven_only = _config_proven_only(scratchpad)
     out: dict[str, str] = {}
     for row in parse_verification_queue_rows(scratchpad):
@@ -17495,6 +17602,11 @@ def _expected_report_index_severities(scratchpad: Path) -> dict[str, str]:
             sev = _demote_severity_once(sev)
         if fid in caps:
             sev = _cap_report_index_severity(sev, caps[fid])
+        # M4: blind-first independent severity cap (anti-inflation). Only
+        # ever lowers (never raises, never drops) — see
+        # `_apply_independent_severity_caps` for the full derivation.
+        if fid in independent_caps:
+            sev = _cap_report_index_severity(sev, independent_caps[fid])
         # Fix 3: NARROW always-on external-assumption severity brake. Fires
         # (regardless of proven_only) ONLY on the three-guard conjunction —
         # CODE-TRACE-only + Attempted:NO-with-external-blocker + external-
@@ -20454,6 +20566,142 @@ def _apply_poc_fail_demotions(scratchpad: Path, mode: str) -> list[dict[str, str
         )
 
     return demotions
+
+
+# ── M4: blind-first independent severity cap (anti-inflation) ─────────────
+# Mirrors the `poc_demotions.md` mechanical-cap precedent end-to-end. The
+# verifier prompt (phase5-verification-prompt.md) requires a MANDATORY
+# `Independent Severity` field, assessed from code+evidence ALONE, filled
+# BEFORE reconciling with the pre-assigned/claimed severity from the
+# verification queue. This function reads that field back and mechanically
+# caps `final = min(independent, claimed)` — i.e. it can ONLY LOWER severity,
+# it NEVER raises it, and it NEVER drops a finding:
+#   - Independent >= claimed (same or MORE severe)   -> no cap
+#   - Independent missing / unparseable / "N/A"      -> no cap (recall-safe;
+#     falls back to claimed)
+#   - Verdict REFUTED / FALSE_POSITIVE / duplicate    -> no cap (N/A class,
+#     the finding isn't in the body at all)
+_INDEPENDENT_SEVERITY_RANK: dict[str, int] = {
+    "Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Informational": 4,
+}
+
+_INDEPENDENT_SEVERITY_SKIP_VERDICTS = frozenset({
+    "REFUTED", "FALSE_POSITIVE", "DROP_FALSE_POSITIVE", "INFEASIBLE",
+    "DUPLICATE", "CONSOLIDATED",
+})
+
+
+def _apply_independent_severity_caps(scratchpad: Path, mode: str) -> list[dict[str, str]]:
+    """M4: cap severity to min(independent, claimed) via the verifier's
+    blind-first Independent Severity assessment.
+
+    Returns a list of cap records and writes `independent_severity_caps.md`
+    (Finding ID | Claimed | Independent | Final) when any cap fires.
+    """
+    if mode == "light":
+        return []
+
+    rows = parse_verification_queue_rows(scratchpad)
+    if not rows:
+        return []
+
+    caps: list[dict[str, str]] = []
+    for row in rows:
+        fid = row.get("finding id", "")
+        claimed_raw = (row.get("severity") or "").strip()
+        if not fid or not claimed_raw:
+            continue
+        claimed = normalize_severity(claimed_raw)
+        if claimed not in _INDEPENDENT_SEVERITY_RANK:
+            continue
+
+        verify_path = _find_verify_file(scratchpad, fid)
+        if not verify_path:
+            continue
+        try:
+            content = verify_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        status = _verifier_status_from_text(content)
+        if status in _INDEPENDENT_SEVERITY_SKIP_VERDICTS:
+            continue
+
+        field = _field_from_markdown(content, ("Independent Severity",))
+        if not field:
+            # Missing field entirely -> no cap (recall-safe fallback to claimed).
+            continue
+        field_clean = field.strip().strip("`*_")
+        if re.fullmatch(r"(?i)\s*n/?a\s*", field_clean):
+            continue
+        independent = try_normalize_severity(field_clean)
+        if not independent or independent not in _INDEPENDENT_SEVERITY_RANK:
+            # Unparseable -> no cap (recall-safe fallback to claimed).
+            continue
+
+        if _INDEPENDENT_SEVERITY_RANK[independent] <= _INDEPENDENT_SEVERITY_RANK[claimed]:
+            # Independent is the same or MORE severe than claimed -> never
+            # raise severity; no cap.
+            continue
+
+        caps.append({
+            "finding_id": fid,
+            "claimed_severity": claimed,
+            "independent_severity": independent,
+            "final_severity": independent,
+        })
+
+    if caps:
+        lines = [
+            "# Independent Severity Caps\n\n",
+            "Findings where the verifier's blind-first Independent Severity "
+            "assessment (assessed from code+evidence alone, before seeing the "
+            "pre-assigned severity) is LOWER than the claimed/queue severity. "
+            "Index Agent MUST respect these severity caps — final = "
+            "min(independent, claimed), stamped Trust Adj. "
+            "INDEPENDENT-MIN(<claimed>).\n\n",
+            "| Finding ID | Claimed | Independent | Final |\n",
+            "|-----------|---------|-------------|-------|\n",
+        ]
+        for c in caps:
+            lines.append(
+                f"| {c['finding_id']} | {c['claimed_severity']} "
+                f"| {c['independent_severity']} | {c['final_severity']} |\n"
+            )
+        (scratchpad / "independent_severity_caps.md").write_text(
+            "".join(lines), encoding="utf-8"
+        )
+
+    return caps
+
+
+def _load_independent_severity_caps(scratchpad: Path) -> dict[str, str]:
+    """Return finding-ID severity caps from independent_severity_caps.md.
+
+    Mirrors `_poc_demotion_caps_for_validator` — read back the mechanically
+    computed ledger so `_expected_report_index_severities` (and the
+    report_index provenance gate) can apply the same min(independent,
+    claimed) cap the Index Agent is instructed to apply.
+    """
+    path = scratchpad / "independent_severity_caps.md"
+    if not path.exists():
+        return {}
+    try:
+        text = _llm_norm(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+    caps: dict[str, str] = {}
+    headers, rows = _parse_markdown_table(text, ["finding id", "final"])
+    if not headers:
+        return caps
+    keys = [_norm_key(h) for h in headers]
+    for row in rows:
+        d = {keys[i]: row[i].strip() for i in range(min(len(keys), len(row)))}
+        fid = _normalize_finding_id(d.get("finding id", "")) or d.get("finding id", "")
+        final = normalize_severity(d.get("final", ""))
+        if fid and final:
+            caps[fid] = final
+    return caps
 
 
 # Per-ecosystem assertion vocabulary. Each ecosystem's "any" / "nontrivial" /

@@ -198,6 +198,21 @@ false positive — it is a real hardening gap whose severity must not ride at Hi
 on an assumed external behavior. A finding whose PoC was actually attempted and
 PASSED is NOT capped (carve-out).
 
+### INDEPENDENT-MIN token
+
+`INDEPENDENT-MIN(claimed_sev)` is the Trust Adj. token for the verifier's
+blind-first independent-severity cap (M4, anti-inflation). Every verifier
+assesses an **Independent Severity** from the code and evidence ALONE, before
+reconciling with the pre-assigned/claimed severity from the verification
+queue — this prevents rubber-stamping an inflated pre-assigned severity. The
+driver mechanically computes `final = min(independent, claimed)` in
+`independent_severity_caps.md` / `severity_binding.md`: if the independent
+assessment is LOWER than the claimed severity, the finding is capped and
+stamped `INDEPENDENT-MIN(<claimed>)`; it stays in the body at the capped
+severity. This is **cap-only**: it can never raise a severity above what was
+claimed, and a REFUTED verdict, or a missing/unparseable Independent Severity
+field, produces no cap at all (falls back to the claimed severity — recall-safe).
+
 **Rules for descriptions**:
 - Write as if the reader has never seen the audit pipeline. No "as identified by the breadth agent" or "this chain combines H-1 with H-3."
 - For chain findings (multiple bugs combining): describe the full attack sequence from start to finish in the Description. The reader should understand the complete attack path without needing to read other findings.

@@ -19,16 +19,16 @@ You are the Report Index Agent. You create the master finding index for the audi
 
 ## Your Inputs
 Read:
-- {SCRATCHPAD}/verify_core.md — **OPTIONAL but primary when present**. Both current SC and L1 pipelines normally produce this via the verification aggregate phase. When absent, enumerate `verify_*.md` files directly and derive the per-hypothesis verdicts from them. Do NOT fail the phase on its absence.
+- {SCRATCHPAD}/verify_core.md — **OPTIONAL but primary when present**. SC and L1 pipelines normally produce this via the verification aggregate phase. When absent, enumerate `verify_*.md` files directly and derive per-hypothesis verdicts. Do NOT fail the phase on its absence.
 - {SCRATCHPAD}/rag_validation.md (historical support / contradiction)
 - {SCRATCHPAD}/finding_mapping.md (hypothesis → agent finding mapping)
 - {SCRATCHPAD}/verification_queue.md (the bounded per-hypothesis view — coverage source)
 - {SCRATCHPAD}/severity_binding.md (driver-computed expected severity per finding)
-- {SCRATCHPAD}/report_index_coverage_seed.md (OPTIONAL, PRIMARY for completeness when present — driver-enumerated ID list of EVERY finding/hypothesis with source verdict, expected tier, mapped hypothesis, and dedup absorbed→survivor relation. The completeness backbone for STEP 5/5.5 — enumerate the full ID set from here, NOT the raw inventory.)
-- {SCRATCHPAD}/candidate_semantic_facets.md (compact preservation ledger for merges/deferred rows)
+- {SCRATCHPAD}/report_index_coverage_seed.md (OPTIONAL, PRIMARY when present — driver-enumerated ID list of EVERY finding/hypothesis with source verdict, expected tier, mapped hypothesis, dedup absorbed→survivor relation. Completeness backbone for STEP 5/5.5 — enumerate the full ID set from here, NOT the raw inventory.)
+- {SCRATCHPAD}/candidate_semantic_facets.md (preservation ledger for merges/deferred rows)
 - {SCRATCHPAD}/contract_inventory.md (component list for report header)
-- {SCRATCHPAD}/recon_summary.md (audit themes and risk areas)
-- {SCRATCHPAD}/template_recommendations.md (recommended niche/analysis lanes)
+- {SCRATCHPAD}/recon_summary.md (themes and risk areas)
+- {SCRATCHPAD}/template_recommendations.md (niche/analysis lanes)
 - The index is a MAPPING task over BOUNDED ledgers. `findings_inventory.md`,
   `hypotheses.md`, and raw `depth_*` / `blind_spot_*` / `scanner_*` /
   `validation_sweep_*` artifacts are fallback-only, single-finding, on-demand
@@ -39,8 +39,9 @@ Read:
   raw depth, or scanner findings up front (fallback-only, missing detail only).
   If it is absent, read `verify_*.md` files directly — each carries its own
   hypothesis ID + verdict header.
-- {SCRATCHPAD}/dedup_candidate_pairs.md (OPTIONAL — pre-computed same-file finding pairs with high title overlap or shared code identifiers. HINTS for Step 1.5 consolidation, not mandates.)
+- {SCRATCHPAD}/dedup_candidate_pairs.md (OPTIONAL — same-file pairs with high title/identifier overlap. HINTS for Step 1.5 consolidation, not mandates.)
 - {SCRATCHPAD}/poc_demotions.md (OPTIONAL — mechanical severity caps where PoC execution disproved the claimed harm; apply in STEP 1 rule 7.)
+- {SCRATCHPAD}/independent_severity_caps.md (OPTIONAL — min(independent, claimed) caps; STEP 1 rule 9; cap-only.)
 
 Forbidden inputs:
 - Do NOT read `{SCRATCHPAD}/report_index.md`, `{SCRATCHPAD}/report_coverage.md`,
@@ -123,16 +124,17 @@ For each hypothesis, apply this priority order:
 1. If a verifier returned a verdict → use verifier's final severity
 2. If chain analysis upgraded severity → use upgraded severity
 3. Otherwise → use the severity from hypotheses.md
-4. **Trust tags**: In `findings_inventory.md`, `[ASSUMPTION-DEP: TRUSTED-ACTOR]` mechanically applies -1 tier downgrade (floor: Informational) and `TRUSTED-ACTOR(original_sev)` in Trust Adj.; `[ASSUMPTION-DEP: WITHIN-BOUNDS]` is index context only. Do not override, remove, or selectively skip Inventory tags.
-5. **Proven-only mode**: Only when `PROVEN_ONLY: true`, cap findings whose best evidence is `[CODE-TRACE]` only at Low and record `PROVEN(original_sev)`. Count demotions for the report header note. When false, `[CODE-TRACE]` does not affect severity. EXCEPTION: keep verifier severity for a `[CODE-TRACE]` finding with a genuine structural-untestability ledger reason — record `STRUCTURAL-UNTESTABLE(original_sev)`; `[PROD-*]` is proof-grade, never capped.
-6. **UNRESOLVED/PARTIAL**: Treat both tokens from `skeptic_*.md` or `judge_*.md` as unresolved verifier disagreement. Apply -1 tier downgrade (floor: Low), record `UNRESOLVED(original_sev)`, keep the finding in the body, and have the writer tag it `[UNRESOLVED - needs human review]`. Placing it in Excluded Findings is a workflow violation.
-7. **Skeptic-judge DOWNGRADE**: If `skeptic_judge_decisions.md` exists, for each row with Decision `DOWNGRADE`, cap the finding's severity at the Final Severity column value and record `SKEPTIC-DOWNGRADE(original_sev)` in Trust Adj. Do NOT apply to rows with Decision KEEP, UNRESOLVED, or PARTIAL (rule 6 handles those). DOWNGRADE takes priority over matrix defaults but yields to PoC evidence (rule 8).
-8. **PoC-fail caps**: If `poc_demotions.md` exists, apply each listed cap, record `POC-FAIL(original_sev)`, and keep the finding in the body. The driver computes this file from `[POC-FAIL]` evidence; the Index Agent must not override or skip entries.
-9. **Driver-only severity overrides**: If `_severity_override_ledger.json`
+4. **Trust tags**: In `findings_inventory.md`, `[ASSUMPTION-DEP: TRUSTED-ACTOR]` applies -1 tier (floor: Informational) and `TRUSTED-ACTOR(original_sev)` in Trust Adj.; `[ASSUMPTION-DEP: WITHIN-BOUNDS]` is index context only. Do not override, remove, or skip Inventory tags.
+5. **Proven-only mode**: Only when `PROVEN_ONLY: true`, cap `[CODE-TRACE]`-only findings at Low and record `PROVEN(original_sev)`; count demotions for the header note. When false, `[CODE-TRACE]` doesn't affect severity. EXCEPTION: a genuine structural-untestability ledger reason keeps verifier severity — record `STRUCTURAL-UNTESTABLE(original_sev)`; `[PROD-*]` is proof-grade, never capped.
+6. **UNRESOLVED/PARTIAL**: Treat both tokens from `skeptic_*.md`/`judge_*.md` as unresolved disagreement. Apply -1 tier (floor: Low), record `UNRESOLVED(original_sev)`, keep in body, tag `[UNRESOLVED - needs human review]`. Placing it in Excluded Findings is a workflow violation.
+7. **Skeptic-judge DOWNGRADE**: If `skeptic_judge_decisions.md` exists, for each `DOWNGRADE` row, cap severity at the Final Severity value and record `SKEPTIC-DOWNGRADE(original_sev)`. Not for KEEP/UNRESOLVED/PARTIAL (rule 6). Priority over matrix defaults, yields to PoC evidence (rule 8).
+8. **PoC-fail caps**: If `poc_demotions.md` exists, apply each listed cap, record `POC-FAIL(original_sev)`, keep in body. Driver-computed from `[POC-FAIL]` evidence; do not override or skip.
+9. **Independent severity caps (M4)**: If `independent_severity_caps.md` exists, apply each cap (`final = min(independent, claimed)`), record `INDEPENDENT-MIN(original_sev)`. From the verifier's mandatory blind-first `Independent Severity` field; do not skip. Cap-only — never raises; missing/unparseable field or REFUTED = no cap.
+10. **Driver-only severity overrides**: If `_severity_override_ledger.json`
    exists, apply only the listed override rows and record
    `SEVERITY_OVERRIDE(original_sev)` in Trust Adj. Agents must not invent this
    token without the driver-only ledger.
-10. Obey driver `status_binding.md`/`severity_binding.md` tokens (Fix 1/3; see `report-template.md`).
+11. Obey driver `status_binding.md`/`severity_binding.md` tokens (Fix 1/3; see `report-template.md`).
 
 ### STEP 1.25: Client-Worthiness Triage (CONSERVATIVE)
 

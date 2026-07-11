@@ -78,6 +78,7 @@ scripts/*
 !scripts/report_index_machinery.py
 !scripts/spike_mechanical_poc.py
 !scripts/enumeration_gate.py
+!scripts/supply_chain_gate.py
 
 # ── Internal bug-bounty lane (never public) ──
 # Explicit denylist so BB coverage is structural, not incidental to `scripts/*`.

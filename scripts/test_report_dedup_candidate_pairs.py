@@ -1,14 +1,20 @@
-"""Fix 4: report-stage cross-tier same-location candidate list.
+"""Fix 4 + Fix 1 (item C): report-stage same-tier AND cross-tier candidate list.
 
 ``_compute_report_dedup_candidate_pairs`` reads report_index.md's Master Finding
-Index and emits ``report_dedup_candidate_pairs.md`` listing every CROSS-TIER pair
-whose FIRST Location range matches within ±3 lines on both endpoints on the same
-file. It is a CANDIDATE HINT generator only — it NEVER merges anything (the
+Index and emits ``report_dedup_candidate_pairs.md`` listing:
+  - every pair (ANY tier combination) whose FIRST Location range matches within
+    ±3 lines on both endpoints on the same file (Fix 4, widened by Fix 1 to also
+    fire same-tier), and
+  - SAME-TIER pairs on the same file whose titles overlap (>= 0.50) or share a
+    specific identifier, even when locations do not match (Fix 1 — the gap where
+    same-tier merging depended on the LLM doing unaided exhaustive comparison).
+It is a CANDIDATE HINT generator only — it NEVER merges anything (the
 report_dedup_agent's same-root-cause + same-fix test + the Python zero-loss gate
 remain the sole merge authority). These tests assert the ±3 tolerance is honored
-(neither loosened nor tightened), cross-tier is enforced, the flagship
-identical-location twin surfaces, distinct-mechanism same-location pairs surface
-as candidates only, and the helper mutates nothing but its own hint file.
+(neither loosened nor tightened), cross-tier location behavior is UNCHANGED, the
+flagship identical-location twin surfaces, same-tier pairs now surface via both
+the location and the title/anchor signals, distinct-mechanism same-location pairs
+surface as candidates only, and the helper mutates nothing but its own hint file.
 """
 from pathlib import Path
 
@@ -129,12 +135,85 @@ def test_flagship_identical_location_twin_surfaces(tmp_path: Path):
     assert frozenset(("H-01", "M-06")) in pairs
 
 
-def test_all_emitted_pairs_are_cross_tier(tmp_path: Path):
+def test_cross_tier_location_pairs_still_present(tmp_path: Path):
+    """Fix 1 scopes the NEW title/anchor signals to same-tier pairs only —
+    cross-tier candidate generation stays location-range-only, UNCHANGED from
+    before. This replaces the old (now-incorrect) 'same-tier never leaks'
+    invariant: same-tier pairs are now an intentional, tested capability (see
+    test_same_tier_pairs_now_surface_via_location below), not a leak."""
     _write_index(tmp_path)
     _compute_report_dedup_candidate_pairs(tmp_path)
-    for pair in _parse_pairs(tmp_path):
-        tiers = {rid[0] for rid in pair}
-        assert len(tiers) == 2, f"same-tier pair leaked: {pair}"
+    pairs = _parse_pairs(tmp_path)
+    cross_tier_pairs = {p for p in pairs if len({rid[0] for rid in p}) == 2}
+    assert frozenset(("H-01", "M-06")) in cross_tier_pairs
+    assert frozenset(("M-10", "L-26")) in cross_tier_pairs
+
+
+def test_same_tier_pairs_now_surface_via_location(tmp_path: Path):
+    """Fix 1 (item C): M-06 and M-22 are BOTH Medium (same tier) at the same
+    location (NativeVault.sol:286-304). Before Fix 1 this pair was silently
+    dropped by the ``if fa["tier"] == fb["tier"]: continue`` skip, so the
+    LLM proposer never saw it as a candidate. It must now surface as a
+    candidate HINT (this helper still never decides the merge)."""
+    _write_index(tmp_path)
+    _compute_report_dedup_candidate_pairs(tmp_path)
+    pairs = _parse_pairs(tmp_path)
+    assert frozenset(("M-06", "M-22")) in pairs
+    # M-01 and M-27 are also both Medium at the exact same NativeVault.sol
+    # range (661-680) — a second same-tier regression check.
+    assert frozenset(("M-01", "M-27")) in pairs
+    # The helper still writes ONLY its hint file for this widened case too.
+    assert (tmp_path / "report_index.md").read_text(encoding="utf-8") == _INDEX
+    assert not (tmp_path / "report_dedup_mapping.md").exists()
+
+
+def test_same_tier_title_and_anchor_signal_zero_location_overlap(tmp_path: Path):
+    """POSITIVE CONTROL (item C, mandate b): two SAME-TIER findings describing
+    the same bug via a shared code identifier in the title, at locations that
+    do NOT overlap (far outside the +/-3 tolerance) and whose titles share no
+    generic wording besides that identifier. Fix 1's title/shared-identifier
+    signal must still surface them as a candidate — the location-range signal
+    alone would miss this pair entirely."""
+    idx = """# Report Index
+
+## Master Finding Index
+
+| Report ID | Title | Severity | Location | Verification | Trust Adj. | Internal Hypothesis |
+|-----------|-------|----------|----------|--------------|-----------|--------------------|
+| M-30 | `_settleEpochRewards` skips users who claimed mid-epoch | Medium | RewardVault.sol:100-110 | VERIFIED | - | X-30 |
+| M-31 | Reward accounting drifts because `_settleEpochRewards` under-counts | Medium | RewardVault.sol:400-410 | VERIFIED | - | X-31 |
+| M-32 | Unrelated fee rounding error | Medium | RewardVault.sol:700-710 | VERIFIED | - | X-32 |
+"""
+    _write_index(tmp_path, idx)
+    n = _compute_report_dedup_candidate_pairs(tmp_path)
+    assert n > 0
+    pairs = _parse_pairs(tmp_path)
+    assert frozenset(("M-30", "M-31")) in pairs
+    # M-32 shares neither location nor title/identifier wording with either —
+    # must NOT be pulled in as a false candidate.
+    assert frozenset(("M-30", "M-32")) not in pairs
+    assert frozenset(("M-31", "M-32")) not in pairs
+
+
+def test_cross_tier_far_apart_titles_do_not_pair(tmp_path: Path):
+    """Cross-tier pairs do NOT get the title/anchor fallback (unchanged
+    behavior) — only same-tier pairs do. Two cross-tier findings at
+    non-overlapping locations that happen to share a title identifier must
+    NOT be paired, since that would be a behavior change to the cross-tier
+    path the task explicitly requires stay unchanged."""
+    idx = """# Report Index
+
+## Master Finding Index
+
+| Report ID | Title | Severity | Location | Verification | Trust Adj. | Internal Hypothesis |
+|-----------|-------|----------|----------|--------------|-----------|--------------------|
+| H-08 | `_settleEpochRewards` skips users who claimed mid-epoch | High | RewardVault.sol:100-110 | VERIFIED | - | X-8 |
+| M-33 | Reward accounting drifts because `_settleEpochRewards` under-counts | Medium | RewardVault.sol:400-410 | VERIFIED | - | X-33 |
+"""
+    _write_index(tmp_path, idx)
+    _compute_report_dedup_candidate_pairs(tmp_path)
+    pairs = _parse_pairs(tmp_path)
+    assert frozenset(("H-08", "M-33")) not in pairs
 
 
 def test_distinct_mechanism_same_location_is_candidate_not_merged(tmp_path: Path):
@@ -212,7 +291,7 @@ def test_no_candidates_writes_empty_marker(tmp_path: Path):
     body = (tmp_path / "report_dedup_candidate_pairs.md").read_text(
         encoding="utf-8"
     )
-    assert "No cross-tier same-location candidate pairs" in body
+    assert "No same-tier or cross-tier candidate pairs" in body
 
 
 def test_cap_never_exceeded(tmp_path: Path):

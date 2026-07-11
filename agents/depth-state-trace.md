@@ -124,6 +124,13 @@ inserted on block proposal — unfinalized forks retain entries forever").
 MISSING on a path the adversary can drive. Two+ MISSING legs upgrades to
 HIGH by default on consensus-reachable paths.
 
+**Near-miss — not the same bug class**: if the target is a compact numeric
+index/handle assigned to a named entity with OTHER structures caching data
+keyed by that same index space (not a single bounded cache's own entries),
+this is asymmetric invalidation across coupled structures, not single-cache
+eviction — see `~/.claude/agents/skills/injectable/l1/execution-client-hardening/SKILL.md`
+§5b "Interned/Compacted Identity Coherence".
+
 ## Output Format
 
 Write to `{scratchpad}/depth_state_trace_findings.md`:

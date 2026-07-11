@@ -93,6 +93,16 @@ def _run_sec3_xray(scratch: Path, proj: Path) -> str:
 # inside LLM prose don't have those.
 _API_RATE_LIMIT_STATUSES = {429, 529}  # 429 Too Many Requests, 529 Overloaded
 
+# When a provider advises a reset window FURTHER out than this, a capped
+# spin-wait (min(estimate, 3600)) + retry would burn a retry re-hitting the same
+# cap. This is the Codex/ChatGPT DAILY usage-cap case (resets hours out with an
+# absolute "try again at <time>"). Above the threshold we preserve state and
+# pause for resume immediately instead. Anthropic 429/529 advise minutes-scale
+# `retry-after` windows and stay below it, so this never misfires on them.
+_RATE_LIMIT_RESUME_THRESHOLD_S = int(
+    os.environ.get("PLAMEN_RATE_LIMIT_RESUME_THRESHOLD_S", "1800") or 1800
+)
+
 # Codex-only extended retry budget. The Codex CLI is a single-pass executor
 # that frequently under-covers a discovery/synthesis phase on the first run
 # and recovers when re-prompted with a delta retry hint. Claude (and every
@@ -992,6 +1002,54 @@ def _codex_auth_available() -> bool:
         return True
     auth_path = Path.home() / ".codex" / "auth.json"
     return auth_path.exists()
+
+
+def _backend_available(backend: str) -> bool:
+    """Check whether *backend* is installed and authenticated.
+
+    Reuses the existing Codex availability gate (binary + OAuth/API-key
+    auth). Claude is the driver's unconditional default backend -- its own
+    spawn path already surfaces a missing binary/auth failure directly, so
+    it has no separate pre-check here (matches every other `cli_backend`
+    read site, which treats "claude" as always selectable).
+    """
+    backend = (backend or "").strip().lower()
+    if backend == "codex":
+        return bool(CODEX_BIN) and _codex_auth_available()
+    return True
+
+
+def _effective_backend(config: dict, phase: "Phase") -> str:
+    """Resolve the CLI backend to use for *phase*.
+
+    Cross-vendor override (Wave-4 M1): `config["phase_backend_overrides"]`
+    is an optional `{phase_name: backend}` map. When it names a backend for
+    *phase* that differs from `config["cli_backend"]` AND that backend is
+    actually available/authenticated, use it. Otherwise (no override, same
+    backend, or override backend unavailable) fall back to
+    `config["cli_backend"]` -- NEVER raises and NEVER fails the phase.
+
+    With no `phase_backend_overrides` key (or none for this phase's name),
+    this returns exactly `config.get("cli_backend", "claude")` -- the
+    pre-existing default-path behavior is unchanged.
+    """
+    default_backend = (config.get("cli_backend") or "claude").strip().lower()
+    overrides = config.get("phase_backend_overrides") or {}
+    phase_name = getattr(phase, "name", phase)
+    override = overrides.get(phase_name) if isinstance(overrides, dict) else None
+    if not override:
+        return default_backend
+    override = str(override).strip().lower()
+    if override == default_backend:
+        return default_backend
+    if _backend_available(override):
+        return override
+    log.warning(
+        f"[{phase_name}] phase_backend_overrides requested backend "
+        f"{override!r} but it is not available/authenticated -- falling "
+        f"back to the configured cli_backend {default_backend!r}."
+    )
+    return default_backend
 
 
 def _codex_auth_is_chatgpt() -> bool:
@@ -7693,7 +7751,7 @@ def _breadth_worker_pool_progress_status(
     )
 
 
-def _run_breadth_worker_pool_pty(
+def _run_breadth_worker_pool_pty_core(
     *,
     scratchpad: Path,
     project_root: str,
@@ -7705,7 +7763,13 @@ def _run_breadth_worker_pool_pty(
     quiescence_s: float,
     attempt: int,
 ) -> int:
-    """Run breadth as bounded top-level Claude PTY workers, one per artifact."""
+    """Run breadth as bounded top-level Claude PTY workers, one per artifact.
+
+    This is the unmodified baseline roster runner (Wave 0) — the M3 hard
+    recall floor. See `_run_breadth_worker_pool_pty` below for the thin
+    wave-gating wrapper; this function's body/behavior is byte-identical to
+    pre-M3.
+    """
     jobs = _breadth_worker_jobs(scratchpad, config)
     if not jobs:
         log.warning("[breadth] worker-pool unavailable: no manifest jobs")
@@ -7855,6 +7919,410 @@ def _run_breadth_worker_pool_pty(
         )
     log.warning("[breadth] worker-pool retry budget exhausted")
     return -2
+
+
+# ===========================================================================
+# Breadth Wave Gating (Wave-4 M3) — yield-gated ADDITIVE breadth waves
+# ===========================================================================
+#
+# Baseline breadth (Wave 0, `_run_breadth_worker_pool_pty_core` above) is the
+# HARD RECALL FLOOR and is completely unmodified by this section: it always
+# runs in full regardless of yield. Everything below is strictly ADDITIVE and
+# strictly opt-in (`breadth_wave_gating_enabled` config flag, default OFF, AND
+# mode must be Thorough) — the default/off path never even evaluates a wave
+# decision. See `_breadth_wave_gating_enabled`.
+#
+# FOLLOW-UP (flagged, intentionally not implemented here): wave jobs are run
+# via a dedicated best-effort pool (`_breadth_run_wave_extension`) OUTSIDE the
+# baseline roster's generic retry/gate loop (`_breadth_open_jobs` /
+# `compute_breadth_row_statuses`), because that loop's completion tracking is
+# keyed off `spawn_manifest.md` (or the JSON worker-pool contract as an
+# EXCLUSIVE fallback only when the manifest is absent) — wave outputs are
+# deliberately not manifest-declared, so folding them into that loop would
+# either (a) require mutating the shared, heavily-tested
+# `compute_breadth_row_statuses` completion-gating code (plamen_validators.py)
+# to union contract-only outputs with manifest outputs, or (b) spin every
+# wave job through the full retry budget every attempt because its status can
+# never read "complete". Both are exactly the "reshaping the pool runner" /
+# "half-landed spawn loop" risk this item calls out — so wave completion is
+# instead judged independently and mechanically, straight off disk
+# (`_breadth_wave_count_above_info`), never via that shared gate.
+
+_BREADTH_WAVE_EXTRA_JOBS_PER_WAVE = 2
+_BREADTH_WAVE_OUTPUT_RE = re.compile(r"^analysis_wave(\d+)_\d+\.md$")
+_BREADTH_WAVE_SEVERITY_LINE_RE = re.compile(
+    r"(?im)^\s*(?:[*_]{0,2})severity(?:[*_]{0,2})\s*:\s*([A-Za-z /]+)"
+)
+
+
+def _breadth_wave_gating_enabled(config: dict) -> bool:
+    """M3: additive breadth waves are Thorough-only and strictly opt-in.
+
+    Absent (or falsy) `breadth_wave_gating_enabled` -> disabled — the
+    default/off path, byte-identical to pre-M3 behavior. Light/Core modes
+    are NEVER wave-gated even if the flag is set (hard mode gate, matches
+    the AUDIT MODES table: waves are a Thorough-only concept). The L1
+    pipeline's breadth jobs use a different shape (layers/skills/difficulty,
+    no `focus_area` roster to rotate) and are intentionally NOT wave-gated
+    yet — flagged as a follow-up, not silently mis-handled.
+    """
+    if not config.get("breadth_wave_gating_enabled"):
+        return False
+    if str(config.get("mode", "core")).lower() != "thorough":
+        return False
+    if (config.get("pipeline") or "sc") == "l1":
+        return False
+    return True
+
+
+def _breadth_wave_count_above_info(scratchpad: Path, outputs: list[str]) -> int:
+    """Mechanically count above-Info findings across the given output files.
+
+    Reuses `_iter_finding_blocks` (the same `## Finding [ID]` / `### Finding
+    [ID]` parser `_compute_depth_confidence` uses) plus `try_normalize_severity`
+    for the severity token on each block's `**Severity**:` line — no new
+    finding format is invented, per the M3 mandate to reuse existing
+    finding counters/parsers. A block with no recognizable severity line is
+    conservatively NOT counted (never inflates yield on malformed output).
+    """
+    count = 0
+    for name in outputs:
+        try:
+            text = (scratchpad / name).read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except Exception:
+            continue
+        for _finding_id, block in _iter_finding_blocks(text):
+            sev_m = _BREADTH_WAVE_SEVERITY_LINE_RE.search(block)
+            if not sev_m:
+                continue
+            norm = try_normalize_severity(sev_m.group(1))
+            if norm and norm != "Informational":
+                count += 1
+    return count
+
+
+def _breadth_wave_yield_threshold(prior_yields: list[int]) -> float:
+    """Running-percentile (median) of prior wave yields. Empty -> 0.0."""
+    if not prior_yields:
+        return 0.0
+    ordered = sorted(prior_yields)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return float(ordered[mid])
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _breadth_wave_should_spawn_next(
+    *,
+    prior_yields: list[int],
+    this_wave_yield: int,
+    waves_spawned_so_far: int,
+    max_extra_waves: int = 2,
+) -> tuple[bool, str]:
+    """Decide whether to spawn one more additive wave.
+
+    `this_wave_yield` is the most recently completed wave's mechanical
+    above-Info finding count (wave 0's yield, the first time this is
+    evaluated); `prior_yields` is every wave's yield strictly BEFORE that
+    one. Spawn iff still productive (yield >= the running median of
+    everything before it — a wave that is at least as productive as the
+    series so far keeps the series going) AND the hard extra-wave cap has
+    not been reached. A wave with zero yield never spawns a follow-up,
+    regardless of history.
+    """
+    if waves_spawned_so_far >= max_extra_waves:
+        return False, (
+            f"hard wave cap reached ({waves_spawned_so_far}/{max_extra_waves})"
+        )
+    if this_wave_yield <= 0:
+        return False, "zero-yield wave -- stopping additive spawn"
+    if not prior_yields:
+        return True, "first measured wave was productive -- sampling next wave"
+    threshold = _breadth_wave_yield_threshold(prior_yields)
+    if this_wave_yield >= threshold:
+        return True, (
+            f"yield {this_wave_yield} >= running median {threshold} -- continuing"
+        )
+    return False, (
+        f"yield {this_wave_yield} < running median {threshold} -- stopping"
+    )
+
+
+def _breadth_wave_extra_jobs(
+    baseline_jobs: list[dict[str, str]],
+    wave_number: int,
+) -> list[dict[str, str]]:
+    """Build a small additive batch of breadth jobs for wave `wave_number`.
+
+    Reuses the exact job-dict shape `_breadth_manifest_jobs` produces
+    (agent_id/focus_area/output) so the existing worker spawn path (prompt
+    builder, PTY runner) needs no changes to consume these jobs; only the
+    focus areas are rotated (a fresh angle on the baseline roster, echoing
+    the Phase 3b/3c re-scan convention of broader/overlapping scope) and
+    output filenames are wave-namespaced (`analysis_wave{N}_{i}.md`) so they
+    never collide with the baseline or an earlier wave's artifact.
+    """
+    if not baseline_jobs or wave_number < 1:
+        return []
+    focus_areas = [
+        str(j.get("focus_area") or "") for j in baseline_jobs if j.get("focus_area")
+    ]
+    jobs: list[dict[str, str]] = []
+    for i in range(1, _BREADTH_WAVE_EXTRA_JOBS_PER_WAVE + 1):
+        rotated = (
+            focus_areas[(i - 1) % len(focus_areas)] if focus_areas
+            else "full codebase"
+        )
+        jobs.append({
+            "agent_id": f"BW{wave_number}-{i}",
+            "focus_area": (
+                f"Wave {wave_number} additive re-scan (fresh angle on: "
+                f"{rotated}) -- broader/overlapping scope, do not re-report "
+                f"prior wave findings"
+            ),
+            "output": f"analysis_wave{wave_number}_{i}.md",
+        })
+    return jobs
+
+
+def _breadth_wave_completed_extra_yields(
+    scratchpad: Path, max_extra_waves: int
+) -> list[int]:
+    """Reconstruct per-wave yields for extra waves already run, from disk.
+
+    Stateless by design (mirrors the driver's disk-gate recovery philosophy
+    used throughout the pipeline): walks contiguous `analysis_wave{N}_*.md`
+    files starting at N=1 and stops at the first gap, so a resumed/retried
+    breadth phase re-derives exactly where the wave series left off without
+    a separate state file.
+    """
+    by_wave: dict[int, list[str]] = {}
+    for p in scratchpad.glob("analysis_wave*_*.md"):
+        m = _BREADTH_WAVE_OUTPUT_RE.match(p.name)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if 1 <= n <= max_extra_waves:
+            by_wave.setdefault(n, []).append(p.name)
+    yields: list[int] = []
+    n = 1
+    while n in by_wave:
+        yields.append(
+            _breadth_wave_count_above_info(scratchpad, sorted(by_wave[n]))
+        )
+        n += 1
+    return yields
+
+
+def _breadth_wave_decide(
+    scratchpad: Path,
+    config: dict,
+    baseline_jobs: list[dict[str, str]],
+    max_extra_waves: int = 2,
+) -> tuple[int, int | None, list[dict[str, str]], str]:
+    """Shared decision core for `_breadth_wave_plan` and live wave execution.
+
+    Returns ``(waves_completed, next_wave_number_or_None, next_wave_jobs,
+    reason)``. ``next_wave_jobs`` is ``[]`` when no further wave is
+    warranted (cap reached or yield fell off); ``next_wave_number`` is
+    ``None`` in that case.
+    """
+    extra_yields = _breadth_wave_completed_extra_yields(
+        scratchpad, max_extra_waves
+    )
+    waves_completed = len(extra_yields)
+    if waves_completed >= max_extra_waves:
+        return waves_completed, None, [], (
+            f"hard wave cap reached ({waves_completed}/{max_extra_waves})"
+        )
+    baseline_yield = _breadth_wave_count_above_info(
+        scratchpad, [str(j["output"]) for j in baseline_jobs]
+    )
+    full_yields = [baseline_yield] + extra_yields
+    this_wave_yield = full_yields[-1]
+    prior_yields = full_yields[:-1]
+    should_spawn, reason = _breadth_wave_should_spawn_next(
+        prior_yields=prior_yields,
+        this_wave_yield=this_wave_yield,
+        waves_spawned_so_far=waves_completed,
+        max_extra_waves=max_extra_waves,
+    )
+    if not should_spawn:
+        return waves_completed, None, [], reason
+    next_wave_number = waves_completed + 1
+    return (
+        waves_completed,
+        next_wave_number,
+        _breadth_wave_extra_jobs(baseline_jobs, next_wave_number),
+        reason,
+    )
+
+
+def _breadth_wave_plan(
+    scratchpad: Path,
+    config: dict,
+    baseline_jobs: list[dict[str, str]],
+    max_extra_waves: int = 2,
+) -> list[dict[str, str]]:
+    """Return the additive-wave job list for THIS breadth planning check.
+
+    HARD RECALL FLOOR: ``baseline_jobs`` (Wave 0) is always the head of the
+    returned list, unmodified — this function only ever APPENDS, never
+    removes or reorders baseline entries. Returns ``baseline_jobs`` itself
+    (same object, byte-identical) when the M3 feature is off, the mode
+    isn't Thorough, or the pipeline is L1 — the default/off path.
+    Reconstructs wave state from disk (see `_breadth_wave_completed_extra_yields`)
+    so replanning is idempotent and safe to call repeatedly / after a resume.
+    """
+    if not baseline_jobs or not _breadth_wave_gating_enabled(config):
+        return baseline_jobs
+    jobs = list(baseline_jobs)
+    waves_completed, next_wave_number, next_jobs, reason = _breadth_wave_decide(
+        scratchpad, config, baseline_jobs, max_extra_waves
+    )
+    for n in range(1, waves_completed + 1):
+        jobs.extend(_breadth_wave_extra_jobs(baseline_jobs, n))
+    log.info(
+        f"[breadth] wave gating: {waves_completed} extra wave(s) completed -> "
+        f"{'SPAWN wave ' + str(next_wave_number) if next_jobs else 'STOP'} "
+        f"({reason})"
+    )
+    if next_jobs:
+        jobs.extend(next_jobs)
+    return jobs
+
+
+def _breadth_run_wave_extension(
+    *,
+    scratchpad: Path,
+    project_root: str,
+    config: dict,
+    phase: Phase,
+    base_cmd: list[str],
+    env: dict[str, str],
+    timeout: float,
+    quiescence_s: float,
+    baseline_jobs: list[dict[str, str]],
+    max_extra_waves: int = 2,
+) -> None:
+    """M3 live wiring: run yield-gated additive breadth waves AFTER the
+    baseline roster (the hard recall floor) has already gate-passed.
+
+    Best-effort and strictly additive: never raises, never influences the
+    caller's return code — a wave that fails to spawn, times out, or writes
+    a low-yield artifact simply stops the series (see
+    `_breadth_wave_should_spawn_next`); it can never fail the phase, because
+    the phase already succeeded on the baseline roster before this runs.
+    Wave-job completion is judged by this function's OWN mechanical finding
+    count (`_breadth_wave_count_above_info`), never via
+    `compute_breadth_row_statuses` — see the module note above this section
+    for why wave outputs are intentionally not manifest-declared.
+    """
+    if not _breadth_wave_gating_enabled(config):
+        return
+    try:
+        for _round in range(max_extra_waves):
+            _waves_completed, wave_number, wave_jobs, reason = (
+                _breadth_wave_decide(
+                    scratchpad, config, baseline_jobs, max_extra_waves
+                )
+            )
+            if not wave_jobs:
+                log.info(f"[breadth] wave extension: stopping ({reason})")
+                break
+            log.info(
+                f"[breadth] wave extension: spawning wave {wave_number} "
+                f"({len(wave_jobs)} job(s)) -- {reason}"
+            )
+            concurrency = min(
+                _BREADTH_WORKER_CONCURRENCY, max(1, len(wave_jobs))
+            )
+            with _NonBlockingWorkerPool(
+                max_workers=concurrency,
+                thread_name_prefix="plamen-breadth-wave-worker",
+            ) as executor:
+                futs = [
+                    executor.submit(
+                        _run_single_breadth_worker_pty,
+                        job=job,
+                        scratchpad=scratchpad,
+                        project_root=project_root,
+                        config=config,
+                        phase=phase,
+                        base_cmd=base_cmd,
+                        env=env,
+                        timeout=timeout,
+                        quiescence_s=quiescence_s,
+                        attempt=1,
+                        retry_reasons=None,
+                        allowed_outputs=[j["output"] for j in wave_jobs],
+                    )
+                    for job in wave_jobs
+                ]
+                for fut in concurrent.futures.as_completed(futs):
+                    try:
+                        result = fut.result()
+                        log.info(
+                            f"[breadth] wave worker {result.get('output')}: "
+                            f"{result.get('status')}"
+                        )
+                    except Exception as exc:
+                        log.warning(f"[breadth] wave worker failed: {exc!r}")
+    except Exception as exc:
+        log.warning(
+            f"[breadth] wave extension aborted (best-effort, non-fatal): "
+            f"{exc!r}"
+        )
+
+
+def _run_breadth_worker_pool_pty(
+    *,
+    scratchpad: Path,
+    project_root: str,
+    config: dict,
+    phase: Phase,
+    base_cmd: list[str],
+    env: dict[str, str],
+    timeout: float,
+    quiescence_s: float,
+    attempt: int,
+) -> int:
+    """Run the baseline breadth roster, then (opt-in, Thorough-only) run
+    best-effort additive yield-gated waves on top of it.
+
+    DEFAULT/OFF PATH IS BYTE-IDENTICAL to `_run_breadth_worker_pool_pty_core`:
+    when `breadth_wave_gating_enabled` is unset/false (or mode isn't
+    Thorough, or the pipeline is L1), this wrapper does nothing but forward
+    the core call's return code unchanged.
+    """
+    rc = _run_breadth_worker_pool_pty_core(
+        scratchpad=scratchpad,
+        project_root=project_root,
+        config=config,
+        phase=phase,
+        base_cmd=base_cmd,
+        env=env,
+        timeout=timeout,
+        quiescence_s=quiescence_s,
+        attempt=attempt,
+    )
+    if rc == 0 and _breadth_wave_gating_enabled(config):
+        baseline_jobs = _breadth_worker_jobs(scratchpad, config)
+        _breadth_run_wave_extension(
+            scratchpad=scratchpad,
+            project_root=project_root,
+            config=config,
+            phase=phase,
+            base_cmd=base_cmd,
+            env=env,
+            timeout=timeout,
+            quiescence_s=quiescence_s,
+            baseline_jobs=baseline_jobs,
+        )
+    return rc
 
 
 # ===========================================================================
@@ -11894,7 +12362,15 @@ def run_phase(phase: Phase, config: dict, attempt: int) -> int:
             except Exception:
                 pass
     # Codex backend: translate prompt paths and inject tool preamble.
-    backend = config.get("cli_backend", "claude")
+    # Wave-4 M1: only the skeptic phase consults phase_backend_overrides
+    # (cross-vendor adversarial diversity). Every other phase keeps the
+    # unconditional `config.get("cli_backend", "claude")` read -- byte-
+    # identical to pre-M1 behavior.
+    backend = (
+        _effective_backend(config, phase)
+        if phase.name == "skeptic"
+        else config.get("cli_backend", "claude")
+    )
     _explicit_claude_exec_mode = (
         config.get("claude_exec_mode")
         or os.environ.get("PLAMEN_CLAUDE_EXEC_MODE")
@@ -12012,8 +12488,20 @@ def run_phase(phase: Phase, config: dict, attempt: int) -> int:
         )
         return EXIT_ERROR
 
-    # Resolve effective model (Light forces sonnet; otherwise phase.model)
-    effective_model = phase_model(phase, config["mode"], config)
+    # Resolve effective model (Light forces sonnet; otherwise phase.model).
+    # phase_model() reads config["cli_backend"] internally to pick between
+    # Claude tier aliases and Codex model IDs. When the resolved `backend`
+    # above differs from the raw config value (skeptic phase_backend_overrides
+    # only -- see the `backend =` assignment), pass phase_model a shallow
+    # config view with cli_backend overridden so the model string matches the
+    # backend actually being spawned. Default path (backend == raw
+    # cli_backend, i.e. everywhere else) passes `config` unchanged.
+    _model_config = (
+        config
+        if backend == (config.get("cli_backend") or "claude").strip().lower()
+        else {**config, "cli_backend": backend}
+    )
+    effective_model = phase_model(phase, config["mode"], _model_config)
 
     if backend == "codex":
         # Pre-create the phase's mandatory first-pass secondary artifacts
@@ -14034,6 +14522,16 @@ def _run_phase_validators(
         demotions = _apply_poc_fail_demotions(scratchpad, mode)
         if demotions:
             log.info(f"[{phase.name}] PoC demotions: {len(demotions)} finding(s) capped via poc_demotions.md")
+        # M4: blind-first independent severity cap (anti-inflation). Only
+        # ever LOWERS severity (final = min(independent, claimed)); never
+        # raises, never drops a finding.
+        independent_caps = _apply_independent_severity_caps(scratchpad, mode)
+        if independent_caps:
+            log.info(
+                f"[{phase.name}] Independent severity caps: "
+                f"{len(independent_caps)} finding(s) capped via "
+                "independent_severity_caps.md"
+            )
 
     # --- crossbatch: quality + full coverage + SC-mode parity/evidence ---
     if phase.name == "crossbatch" and passed:
@@ -17918,19 +18416,23 @@ def main():
             # actual bounded dedup worker.
             _skip_artifact_recovery_this_phase = True
 
-        # Fix 4: pre-compute the cross-tier same-location candidate HINT list for
-        # the report_dedup_agent (Phase 6d LLM proposer). The mechanical
-        # report_dedup pass has no candidate list, so an identical-location twin
-        # across tiers (a High and a Medium at the same lines) never reached the
-        # proposer. This writes report_dedup_candidate_pairs.md (candidate-only —
-        # the agent's same-root-cause + same-fix test stays the sole merge
+        # Fix 4 + Fix 1 (item C): pre-compute the same-tier AND cross-tier
+        # candidate HINT list for the report_dedup_agent (Phase 6d LLM
+        # proposer). Fix 4 covered cross-tier identical-location twins (a High
+        # and a Medium at the same lines); Fix 1 closed the gap where the
+        # candidate list stayed cross-tier-only even after the mechanical
+        # executor (`_dedup_report_candidate_pairs`) was widened to generate
+        # same-tier candidates too — same-tier merging depended on the LLM
+        # doing unaided exhaustive pairwise comparison with no scaffolding.
+        # This writes report_dedup_candidate_pairs.md (candidate-only — the
+        # agent's same-root-cause + same-fix test stays the sole merge
         # authority). Best-effort: a failure only loses the hint, never a finding.
         if phase.name == "report_dedup_agent":
             try:
                 n_cand = _compute_report_dedup_candidate_pairs(scratchpad)
                 log.info(
                     f"[report_dedup_agent] wrote report_dedup_candidate_pairs.md "
-                    f"({n_cand} cross-tier same-location candidate pair(s))"
+                    f"({n_cand} same-tier/cross-tier candidate pair(s))"
                 )
             except Exception as exc:
                 log.warning(
@@ -19641,10 +20143,32 @@ def main():
                 log.warning(f"[{phase.name}] rate limit detected -- auto-waiting")
                 checkpoint.rate_limited_at = phase.name
                 checkpoint.save(scratchpad)
-                wait_s = estimate_rate_limit_wait_seconds(
+                _wait_raw = estimate_rate_limit_wait_seconds(
                     scratchpad / f"_stdio_{phase.name}.log"
                 )
-                wait_s = min(wait_s or 300, 3600)
+                # A far-future reset (Codex/ChatGPT DAILY usage cap resetting
+                # hours out, advised as an absolute "try again at <time>") must
+                # NOT trigger a capped spin-wait + retry that just re-hits the
+                # same cap. Preserve state and pause for resume immediately,
+                # surfacing the real reset window. Anthropic minutes-scale
+                # retry-after windows stay under the threshold and take the
+                # normal auto-wait path below.
+                if (
+                    _wait_raw is not None
+                    and _wait_raw > _RATE_LIMIT_RESUME_THRESHOLD_S
+                ):
+                    log.warning(
+                        f"[{phase.name}] provider reset is ~{_wait_raw / 3600.0:.1f}h "
+                        f"away ({_wait_raw}s) -- preserving state for resume "
+                        f"instead of a capped spin-wait + retry that would "
+                        f"re-hit the same cap"
+                    )
+                    checkpoint.rate_limited_at = phase.name
+                    checkpoint.save(scratchpad)
+                    display.print_rate_limit_pause(str(config_path))
+                    _rate_limit_halt = True
+                    break
+                wait_s = min(_wait_raw or 300, 3600)
                 try:
                     display.rate_limit_wait_interactive(wait_s, phase.name)
                 except KeyboardInterrupt:

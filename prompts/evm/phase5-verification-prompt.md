@@ -218,6 +218,24 @@ or function (a native↔wrapped conversion is only an illustrative example of a
 boundary where `CONSERVATION` looks satisfied yet `REQUESTED_EQ_DELIVERED` can
 still diverge). Symbols always resolve at the locus at runtime.
 
+## INDEPENDENT SEVERITY ASSESSMENT (MANDATORY — M4 anti-inflation)
+
+Before reconciling with any pre-assigned/claimed severity (from the hypothesis, queue, or inventory), assess a severity INDEPENDENTLY:
+
+1. Read ONLY the code and your own evidence (PoC result, code trace, dual-perspective verdict from above). Deliberately IGNORE the claimed/pre-assigned severity for this step - do not let it anchor your judgment.
+2. Apply the standard severity matrix (Impact x Likelihood) from `~/.claude/rules/report-template.md` to what YOU found, as if no severity had been pre-assigned.
+3. Record the result in your output BEFORE finalizing your Severity field:
+
+```
+**Independent Severity**: <Critical|High|Medium|Low|Informational|N/A>
+```
+
+- Assessed from the code and evidence ALONE; ignore any pre-assigned severity.
+- Use `N/A` ONLY when your verdict is REFUTED/FALSE_POSITIVE (no independent severity applies to a non-finding).
+- This field is MANDATORY for every non-REFUTED verdict. The driver reads it to mechanically compute `final = min(Independent Severity, claimed severity)` - this can ONLY LOWER the reported severity, it NEVER raises it and NEVER drops the finding. A missing or unparseable field is recall-safe: it simply falls back to the claimed severity (no cap applied).
+
+Do NOT skip this field to save time, and do NOT default it to the claimed severity - that defeats its purpose of catching an inflated pre-assigned severity.
+
 ## FIX GENERATION (POC-PASS only)
 If your PoC PASSES (verdict = CONFIRMED with [POC-PASS]):
 1. Write a minimal diff-style fix (smallest change that eliminates the bug)

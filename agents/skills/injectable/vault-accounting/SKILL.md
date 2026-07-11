@@ -14,6 +14,7 @@ description: "Protocol Type Trigger vault (detected in recon TASK 0 Step 1) - In
 When decomposing this skill into depth agent investigation questions, map sections to domains:
 - Sections 1, 4: depth-edge-case (share price boundaries, first depositor)
 - Sections 2, 2b: depth-state-trace (time-decay state consistency, anchor timestamps)
+- Section 2c: depth-edge-case OR depth-state-trace (reported-vs-held asset divergence at dust supply)
 - Sections 3, 5, 5b: depth-token-flow (fee flows, cross-fee ratios, fee solvency)
 - Section 6: depth-edge-case OR depth-state-trace (withdrawal fairness)
 
@@ -60,6 +61,16 @@ For time-weighted calculations (fees, vesting, rewards) that use a `(value × ti
 5. Test: what happens if the anchor timestamp is 7 days stale when a new period of 7 days starts? fraction = 7d/(7d+7d) = 50% vests immediately instead of 0%
 
 Tag: `[TRACE:new_period_start → anchor_timestamp NOT updated → timeDelta includes {stale_duration} → {acceleration_factor}x acceleration]`
+
+### 2c. Reported-vs-Held Asset Divergence at Dust Supply
+
+For any accounting getter intentionally OVERRIDDEN to diverge from the real held balance (excluding an unvested/streaming/pending component):
+
+1. Determine whether its output can INCREASE purely from elapsed time (vesting) with no deposit/withdraw/donation event.
+2. If yes, at every window where `totalSupply` is zero or dust while that divergence is closing, compute `shares = deposit * totalSupply / reportedAssets()` with real constants for a minimal deposit — does round-down zero/critically dilute the depositor because reported-assets rose ahead of supply?
+3. Treat as a first-depositor/inflation-family finding whose value-injection trigger is the protocol's OWN accounting formula (time-based vesting), not an external donation — check the HARM in the depositor-LOSES direction, not only the attacker-profits direction of ZERO_STATE_RETURN §2a.
+
+Tag: `[TRACE:reportedAssets() rises via vesting_elapsed → totalSupply=dust → shares=deposit*totalSupply/reportedAssets() rounds down → depositor loses principal]`
 
 ## 3. Cross-Fee Ratio Dependency (if applicable)
 
@@ -113,6 +124,7 @@ Tag: `[TRACE:loss_event → fee_base_unchanged → feesOwed > available_assets �
 | 1. Share Price Under Adversity | YES | | |
 | 2. Time-Decay State Consistency | IF time-decay mechanism detected | | |
 | 2b. Time-Weighted Anchor Validation | IF time-weighted mechanism detected | | |
+| 2c. Reported-vs-Held Asset Divergence at Dust Supply | IF overridden accounting getter detected | | |
 | 3. Cross-Fee Ratio Dependency | IF multiple fee types detected | | |
 | 4. First Depositor / Re-entry | YES | | |
 | 5. Fee Source Analysis | IF fee mechanism detected | | |

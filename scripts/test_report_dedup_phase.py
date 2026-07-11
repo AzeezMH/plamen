@@ -160,12 +160,96 @@ def test_candidate_pairs_cross_tier_shared_location_and_poc():
     assert not any({"C-01", "H-04"} == {p["keep"], p["absorb"]} for p in pairs)
 
 
-def test_same_tier_pairs_never_candidates():
-    # report_index STEP-1.5 owns same-tier merges; this phase must skip them.
-    recs = M._dedup_report_sections(_REPORT_TWO_TIER)
+# The prior version of this test asserted that NO same-tier pair is EVER a
+# candidate. That was vacuously true only because `_REPORT_TWO_TIER`'s two
+# same-tier findings (H-03, H-04) happen to be genuinely unrelated — the
+# assertion held regardless of whether same-tier candidate generation was
+# implemented at all. `_dedup_report_candidate_pairs`'s own docstring already
+# states candidate generation "spans BOTH same-tier and cross-tier pairs
+# (F2)" — the two tests below make that a REAL, non-vacuous assertion: a
+# genuine same-tier duplicate DOES surface as a candidate (positive control),
+# while two genuinely different same-tier bugs at the same site do NOT reach
+# a merge decision (negative control, via the actual merge-authority gate).
+
+
+def test_same_tier_duplicate_is_a_candidate_pair():
+    """Same-tier candidate generation is REAL, not vacuous: two SAME-TIER
+    findings describing the same bug at the same location DO surface as a
+    candidate pair (report_dedup is the deterministic backstop for same-tier
+    duplicates that report_index STEP-1.5 misses — see the function's own
+    docstring, 'F2')."""
+    report = """# Security Audit Report — demo
+
+## Medium Findings
+
+### [M-01] Reentrancy in withdraw [VERIFIED]
+
+**Severity**: Medium
+**Location**: `src/Vault.sol:L42`
+**Description**: The withdraw path is reentrant.
+**Impact**:
+- Attacker drains the vault.
+**Recommendation**: Add a reentrancy guard.
+
+### [M-02] Reentrancy withdraw bug [VERIFIED]
+
+**Severity**: Medium
+**Location**: `src/Vault.sol:L42`
+**Description**: Same reentrant withdraw, surfaced again.
+**Impact**:
+- Funds can be stolen by reentering.
+**Recommendation**: Add nonReentrant.
+"""
+    recs = M._dedup_report_sections(report)
     pairs = M._dedup_report_candidate_pairs(recs, {})
-    for p in pairs:
-        assert p["keep"][0] != p["absorb"][0], f"same-tier pair leaked: {p}"
+    same_tier = [p for p in pairs if {p["keep"], p["absorb"]} == {"M-01", "M-02"}]
+    assert same_tier, f"expected M-01/M-02 same-tier candidate pair, got {pairs}"
+
+
+# Same-tier findings at the same code site describing two DIFFERENT bugs
+# (missing access control vs. missing event emission) — a shared function name
+# alone is deliberately NOT enough to merge (see `_dedup_same_root_cause_ok`'s
+# docstring: "a single shared anchor ... is just a co-located function name,
+# i.e. a different bug").
+_REPORT_SAME_TIER_DIFFERENT_BUGS = """# Security Audit Report — demo
+
+## Medium Findings
+
+### [M-01] withdrawFunds lacks an onlyOwner access-control check [VERIFIED]
+
+**Severity**: Medium
+**Location**: `src/Vault.sol:L120-135`
+**Description**: Any address can call withdrawFunds and drain the vault.
+**Impact**:
+- Attacker drains the vault.
+**Recommendation**: Restrict withdrawFunds to the contract owner with an onlyOwner modifier.
+
+### [M-02] withdrawFunds omits a WithdrawalProcessed event emission [VERIFIED]
+
+**Severity**: Medium
+**Location**: `src/Vault.sol:L120-135`
+**Description**: withdrawFunds transfers funds but never emits WithdrawalProcessed, breaking off-chain accounting.
+**Impact**:
+- Off-chain indexers miss withdrawals.
+**Recommendation**: Emit a WithdrawalProcessed event whenever a payout succeeds.
+"""
+
+
+def test_same_tier_different_bugs_not_merge_eligible():
+    """NEGATIVE CONTROL (item C, mandate a): two SAME-TIER findings at the
+    SAME code site that are DIFFERENT bugs must NOT be merge-eligible.
+    Candidate generation may surface them (a shared site/site-adjacent title
+    is only ever a HINT — see F2), but the merge AUTHORITY
+    (`_dedup_same_fix_ok`, unchanged by this fix) must refuse them: KEEP
+    SEPARATE, never MERGE."""
+    recs = M._dedup_report_sections(_REPORT_SAME_TIER_DIFFERENT_BUGS)
+    a = next(r for r in recs if r["id"] == "M-01")
+    b = next(r for r in recs if r["id"] == "M-02")
+    ok, reason = M._dedup_same_fix_ok(a, b)
+    assert ok is False, (
+        f"different same-tier bugs at the same site must NOT be merge-"
+        f"eligible, got ok=True reason={reason!r}"
+    )
 
 
 def test_title_jaccard():

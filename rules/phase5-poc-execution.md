@@ -55,6 +55,16 @@ names a real environmental blocker. `STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION`
 is not an allowed skip reason for `unit` or `property` rows; reclassify the row
 or attempt the test.
 
+**Cargo languages (soroban / solana / l1_rust)**: for `unit` and `property`
+rows, the PoC MUST be placed in-crate under the target workspace member's
+`src/` (e.g. `src/poc_{id}.rs` wired via `#[cfg(test)] mod`), never authored
+only as a bare top-level `tests/*.rs` or inlined into `lib.rs`. See the
+language-specific `phase5-verification-prompt.md` for the exact file/command
+shape. `STRUCTURAL_NO_EXECUTABLE_HARM_ASSERTION` remains DISALLOWED for
+`unit`/`property` rows in these languages whenever a build/test harness
+exists — the in-crate placement removes the linking blocker that would
+otherwise justify a structural skip.
+
 Allowed no-execution reasons:
 
 - `NO_BUILD_ENVIRONMENT`

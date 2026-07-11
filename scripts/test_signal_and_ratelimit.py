@@ -389,7 +389,13 @@ def test_all_claude_pty_worker_pools_stamp_rate_limit_sentinel():
 def test_worker_pools_fail_fast_on_child_rate_limit():
     for fn in (
         D._run_recon_worker_pool_pty,
-        D._run_breadth_worker_pool_pty,
+        # Wave-4 M3 split the breadth pool into a thin wave-gating wrapper
+        # (`_run_breadth_worker_pool_pty`) over the unchanged roster runner
+        # (`_run_breadth_worker_pool_pty_core`). The child-rate-limit
+        # fail-fast loop lives in the core; the wrapper forwards the core's
+        # rc unchanged (wave extension runs only on rc==0), so the guard must
+        # inspect the core for the breadth pool.
+        D._run_breadth_worker_pool_pty_core,
         D._run_rescan_worker_pool_pty,
         D._run_depth_worker_batch,
     ):

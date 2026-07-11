@@ -56,6 +56,14 @@ class FindingProbe:
     test_file_resolved: Optional[str] = None  # absolute path if locatable
     test_function: Optional[str] = None  # extracted from Test File or Command
     test_command: Optional[str] = None
+    # v2.8.x cargo PoC discovery: parsed HINTS from the Command field only —
+    # never used to shell-exec the raw Command string. mechanical_verify uses
+    # these to thread a workspace-member `-p <package>` / feature set even
+    # when the captured test path alone doesn't resolve. All optional; absent
+    # unless the Command field actually named them.
+    package: Optional[str] = None       # -p / --package <pkg>
+    test_target: Optional[str] = None   # --test <target>
+    features: list[str] = field(default_factory=list)  # --features a,b,c
     # Mechanical execution
     forge_status: str = "NOT_RUN"  # NOT_RUN | NO_TEST_FILE | COMPILE_FAIL |
                                     # TIMEOUT | PASS | FAIL | NO_TEST_MATCH |
@@ -112,6 +120,18 @@ _MATCH_TEST_RE = re.compile(
 _MATCH_PATH_RE = re.compile(
     r"--match-path\s+[\"']?([^\"'\s]+)[\"']?"
 )
+# Cargo Command hints (solana/soroban/l1_rust) — parsed as HINTS only. NEVER
+# used to shell-exec the raw Command string; mechanical_verify re-derives its
+# own argv from the registry template and only consults these fields.
+_CMD_PACKAGE_RE = re.compile(
+    r"(?:^|\s)(?:-p|--package)(?:[=\s]+)([A-Za-z0-9_][A-Za-z0-9_\-]*)"
+)
+_CMD_TEST_TARGET_RE = re.compile(
+    r"(?:^|\s)--test(?:[=\s]+)([A-Za-z0-9_][A-Za-z0-9_.\-]*)"
+)
+_CMD_FEATURES_RE = re.compile(
+    r"--features(?:[=\s]+)([A-Za-z0-9_,]+)"
+)
 
 # v2.8.16 Phase 1 (#1d + adversarial-review must-fix #3): ecosystem-agnostic,
 # test-DIR-ANCHORED path extraction. The EVM-only `.t.sol`-under-`test/` regex
@@ -119,11 +139,22 @@ _MATCH_PATH_RE = re.compile(
 # never reach PASS. These patterns are anchored to test directories so a bare
 # `src/lib.rs` / `build.rs` token is never mistaken for the harm test (the
 # reviewer's #3). Go test files self-anchor via the `_test.go` suffix.
+# v2.8.x cargo PoC discovery fix: for the three cargo ecosystems, an
+# unanchored `re.search` starting the match AT the `tests?/` segment DROPS
+# any workspace-member crate-directory prefix (e.g. on
+# `principal-token/tests/poc_h09.rs` it captured only `tests/poc_h09.rs`),
+# and the truncated path then has no crate prefix left for
+# `mechanical_verify._resolve_test_path_for` to resolve against a multi-crate
+# workspace -> NO_TEST_FILE before cargo ever runs. Prepend an OPTIONAL
+# repeated crate-directory-segment group so the FULL crate-relative path is
+# captured when present, while a bare `tests/foo.rs` (no crate prefix) still
+# matches exactly as before via the zero-repetition case. EVM is unaffected
+# (byte-identical) — Foundry projects are single-root, not multi-crate.
 _TEST_PATH_BY_LANG: dict[str, re.Pattern] = {
     "evm":     re.compile(r"((?:test|tests)/[\w.\-/]+\.t\.sol)"),
-    "solana":  re.compile(r"((?:tests?/|trident-tests/)[\w.\-/]+\.rs)"),
-    "soroban": re.compile(r"((?:src/)?tests?/[\w.\-/]+\.rs)"),
-    "l1_rust": re.compile(r"((?:src/[\w.\-/]*?)?tests?/[\w.\-/]+\.rs)"),
+    "solana":  re.compile(r"((?:[\w.\-]+/)*(?:tests?/|trident-tests/)[\w.\-/]+\.rs)"),
+    "soroban": re.compile(r"((?:[\w.\-]+/)*(?:src/)?tests?/[\w.\-/]+\.rs)"),
+    "l1_rust": re.compile(r"((?:[\w.\-]+/)*(?:src/[\w.\-/]*?)?tests?/[\w.\-/]+\.rs)"),
     "aptos":   re.compile(r"((?:sources/)?tests?/[\w.\-/]+\.move)"),
     "sui":     re.compile(r"((?:sources/)?tests?/[\w.\-/]+\.move)"),
     "l1_go":   re.compile(r"([\w.\-/]+_test\.go)"),
@@ -254,6 +285,12 @@ def parse_verify_file(verify_path: Path,
     if not test_path:
         test_path = _extract_test_path(test_file_field, command, language)
 
+    # Cargo Command hints (HINTS only — see the regex comments above).
+    pkg_m = _CMD_PACKAGE_RE.search(command) if command else None
+    target_m = _CMD_TEST_TARGET_RE.search(command) if command else None
+    feat_m = _CMD_FEATURES_RE.search(command) if command else None
+    features = feat_m.group(1).split(",") if feat_m else []
+
     return FindingProbe(
         verify_file=verify_path.name,
         finding_id=finding_id,
@@ -264,6 +301,9 @@ def parse_verify_file(verify_path: Path,
         test_file_resolved=test_path,
         test_function=test_function,
         test_command=command,
+        package=(pkg_m.group(1) if pkg_m else None),
+        test_target=(target_m.group(1) if target_m else None),
+        features=features,
     )
 
 

@@ -27,12 +27,17 @@ to identify the semantic relationships the mechanical signals miss.
 - `{SCRATCHPAD}/finding_mapping.md` — hypothesis → source-finding IDs (use to
   confirm two report findings share provenance).
 - `{SCRATCHPAD}/report_dedup_candidate_pairs.md` — OPTIONAL driver-computed HINT
-  list of CROSS-TIER pairs whose FIRST Location range matches within ±3 lines on
-  the same file. These are CANDIDATES ONLY, not merge instructions: same lines is
-  a coincidence signal. Apply the consolidation test below to BOTH full bodies
-  before proposing a MERGE. Two DISTINCT bugs at the same location (different
-  mechanism / different fix) MUST stay separate. The file may be absent or empty
-  — that is fine; still run your own full semantic pass over the report.
+  list. Covers TWO cases: (1) any-tier pairs whose FIRST Location range matches
+  within ±3 lines on the same file, and (2) SAME-TIER pairs on the same file
+  whose titles overlap or share a specific identifier (e.g. a function/struct
+  name) even when the locations differ. These are CANDIDATES ONLY, not merge
+  instructions: a matching location, similar title, or shared identifier is a
+  coincidence signal. Apply the consolidation test below to BOTH full bodies
+  before proposing a MERGE. Two DISTINCT bugs that merely trip a signal
+  (different mechanism / different fix — including two different bugs that
+  happen to name the same function) MUST stay separate. The file may be absent
+  or empty — that is fine; still run your own full semantic pass over the
+  report, same-tier included.
 
 Read the FULL body of any finding you are considering merging — title alone is
 not enough. Base every decision on the Description, Impact, and Recommendation
@@ -58,6 +63,23 @@ High > Medium > Low > Informational). If equal severity, the one with the more
 complete Description/Impact. The absorbed finding's distinct locations, impacts,
 and PoC references are preserved by the Python executor under the survivor — you
 do not need to copy them.
+
+**Same-tier duplicates are also in scope.** `report_index.md`'s STEP-1.5
+consolidation only catches a SUBSET of same-tier root-cause duplicates — you are
+the deterministic backstop within a tier too, not only across tiers. Use the
+same-tier rows in `report_dedup_candidate_pairs.md` (when present) as a starting
+point, then keep scanning the report yourself.
+
+**Coverage receipt (MANDATORY).** Every candidate pair listed in
+`report_dedup_candidate_pairs.md` MUST receive an EXPLICIT disposition in your
+output — either a row in the `## MERGE Decisions` table (if the consolidation
+test passes) OR a row in the `## Reviewed — Kept Separate` table (if it fails,
+with the reason). A candidate pair that appears in NEITHER table is a silently
+skipped duplicate — exactly the failure this receipt prevents. If the hint file
+is absent/empty, this requirement is vacuous, but you still run your own full
+semantic pass. Covering a pair with "kept separate" is always acceptable when
+the consolidation test does not clearly pass — the receipt forces a decision, it
+never forces a merge (when in doubt, KEEP SEPARATE).
 
 **Cross-tier is explicitly in scope.** The most valuable merges you make are the
 ones the mechanical same-tier pass cannot: e.g. an UNVERIFIED High that is the

@@ -31,6 +31,16 @@ except Exception:  # pragma: no cover - standalone/fallback
     def _plamen_home() -> Path:
         return Path(os.path.expanduser("~/.claude"))
 
+# ITEM H2: fail-closed supply-chain gate. Sibling module, stdlib only — see
+# supply_chain_gate.py. Deliberately no try/except fallback: unlike
+# plamen_home (which has a documented legacy default), there is no safe
+# "pretend the gate passed" fallback for a missing security module. The
+# module import (not just the two names) is kept too so tests can reach
+# `supply_chain_gate.DEFAULT_IOC_DENYLIST` / `_call_offline_scanner` through
+# this module's namespace for monkeypatching.
+import supply_chain_gate
+from supply_chain_gate import SupplyChainAbortError, gate_supply_chain
+
 # Module logger. `_scip_to_graph_artifacts` emits a log.warning on the
 # large-index (>callee-node-cap) PARTIAL path; without this module-level logger
 # that call raised `NameError: name 'log' is not defined` on big repos
@@ -449,6 +459,207 @@ def _write_interface_parity_findings(scratch: Path, proj: Path) -> str:
             "",
         ]
     _write_text(scratch / "niche_interface_parity_findings.md", "\n".join(lines) + "\n")
+    return "WRITTEN"
+
+
+# M2 (recall): permissionless-setter detector. External/public functions that
+# write contract state but declare no access gate (modifier or body guard) are
+# a candidate missing-access-control finding. Mechanical Solidity parse — no
+# SCIP dependency, testable in isolation. Favors precision: any recognizable
+# access gate (modifier or `require(msg.sender == ...)`-style body guard)
+# excludes the function, since an admin-setter false-positive flood is the
+# failure mode to avoid for an additive niche detector.
+_SOL_ACCESS_MODIFIER_RE = re.compile(
+    r"\b(onlyOwner|onlyRole|onlyAdmin|onlyGovernance|auth|restricted)\b"
+)
+# Body guard checked only near the top of the function body ("first
+# statements") — a late-body check does not gate the state write above it.
+_SOL_BODY_GUARD_RE = re.compile(
+    r"require\s*\(\s*msg\.sender\s*==|_checkOwner\s*\(|_checkRole\s*\(|"
+    r"hasRole\s*\(|if\s*\(\s*msg\.sender\s*!=[^)]*\)\s*revert|_onlyOwner\s*\(",
+    re.DOTALL,
+)
+_SOL_INITIALIZER_NAME_RE = re.compile(
+    r"(?i)^(re)?initiali[sz]e(_unchained)?$|^__\w*_init(_unchained)?$|^init$"
+)
+_SOL_CONTRACT_DECL_RE = re.compile(r"\b(?:contract|library)\s+([A-Za-z_]\w*)")
+
+
+def _sol_find_body(text: str, pos: int) -> Tuple[Optional[int], Optional[int]]:
+    """From `pos` (end of a function's name+params match), scan forward at
+    paren-depth 0 for the function body's opening `{`, skipping over any
+    top-level parens (e.g. modifier args, `returns (...)`). Returns
+    (body_start, body_end) char offsets of the `{...}` block (body_end is
+    exclusive, just past the matching `}`), or (None, None) if the
+    declaration ends in `;` first (abstract/interface/virtual — no body).
+    Comment/string-agnostic heuristic, matching this module's regex-based
+    style; never raises."""
+    depth = 0
+    i, n = pos, len(text)
+    while i < n:
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and c == "{":
+            bdepth, j = 1, i + 1
+            while j < n and bdepth > 0:
+                if text[j] == "{":
+                    bdepth += 1
+                elif text[j] == "}":
+                    bdepth -= 1
+                j += 1
+            return i, j
+        elif depth == 0 and c == ";":
+            return None, None
+        i += 1
+    return None, None
+
+
+def _sol_fn_spans(text: str) -> List[Tuple[int, int]]:
+    """All function body [start, end) char spans in `text`, any visibility."""
+    spans: List[Tuple[int, int]] = []
+    for m in _EVM_FN_RE.finditer(text):
+        b0, b1 = _sol_find_body(text, m.end())
+        if b0 is not None:
+            spans.append((b0, b1))
+    return spans
+
+
+def _sol_state_var_names(text: str) -> set:
+    """Contract-level state variable names — `_EVM_STATE_RE` matches restricted
+    to positions OUTSIDE any function body span, so function-local
+    declarations that happen to match the same line-start shape are not
+    mistaken for contract state."""
+    spans = _sol_fn_spans(text)
+
+    def _in_fn(idx: int) -> bool:
+        return any(s <= idx < e for s, e in spans)
+
+    return {m.group(2) for m in _EVM_STATE_RE.finditer(text) if not _in_fn(m.start())}
+
+
+def _sol_body_writes_state(body: str, state_vars: set) -> bool:
+    """True if `body` contains a plain/compound assignment or increment to
+    any name in `state_vars` (bare `x = `, indexed `x[..] = `, `+=`/`-=`/etc.,
+    `++`/`--`). Comparison operators (`==`, `!=`, `<=`, `>=`) never match."""
+    if not state_vars:
+        return False
+    names = "|".join(re.escape(v) for v in sorted(state_vars, key=len, reverse=True))
+    pat = re.compile(
+        rf"(?<![.\w])(?:{names})\s*(?:\[[^\]]*\])?\s*(?:\+\+|--|[-+*/%&|^]?=(?!=))"
+    )
+    return bool(pat.search(body))
+
+
+def compute_permissionless_setter_findings(project_root) -> List[dict]:
+    """Mechanically find external/public functions that write contract state
+    with no recognizable access gate (modifier or body guard). Conservative —
+    excludes view/pure, constructor, initializers, and anything with a
+    plausible gate; favors precision over recall. Returns Low-severity
+    finding dicts. Never raises."""
+    root = Path(project_root)
+    try:
+        files = _production_source_files(root, (".sol",))
+    except Exception:
+        return []
+    findings: List[dict] = []
+    n = 0
+    for f in sorted(files):
+        text = _read_text(f)
+        if not text:
+            continue
+        try:
+            ext_pub = _sol_ext_pub_fns(text)
+            if not ext_pub:
+                continue
+            state_vars = _sol_state_var_names(text)
+            if not state_vars:
+                continue
+            for m in _EVM_FN_RE.finditer(text):
+                name = m.group(1)
+                if name not in ext_pub:
+                    continue
+                line = _line_of(text, m.start())
+                if line != ext_pub[name]:
+                    continue  # not the occurrence _sol_ext_pub_fns attributed
+                if _SOL_INITIALIZER_NAME_RE.match(name):
+                    continue
+                body_start, body_end = _sol_find_body(text, m.end())
+                if body_start is None:
+                    continue  # abstract/interface declaration, no body
+                header = text[m.start():body_start]
+                if re.search(r"\b(view|pure)\b", header):
+                    continue
+                if _SOL_ACCESS_MODIFIER_RE.search(header):
+                    continue
+                body = text[body_start:body_end]
+                if _SOL_BODY_GUARD_RE.search(body[:400]):
+                    continue
+                if not _sol_body_writes_state(body, state_vars):
+                    continue
+                n += 1
+                cname = "?"
+                for cm in _SOL_CONTRACT_DECL_RE.finditer(text):
+                    if cm.start() > m.start():
+                        break
+                    cname = cm.group(1)
+                findings.append({
+                    "id": f"PSET-{n}",
+                    "title": f"`{cname}.{name}` writes state with no access gate",
+                    "location": f"{_rel(f, root)}:L{line}",
+                    "severity": "Low",
+                    "description": (
+                        f"`{cname}.{name}` is external/public and writes to "
+                        "contract state, but declares neither a role-gating "
+                        "modifier (onlyOwner/onlyRole/onlyAdmin/onlyGovernance/"
+                        "auth/restricted) nor an equivalent body guard "
+                        "(require(msg.sender == ...), _checkOwner(), "
+                        "_checkRole(...), hasRole(...)). Mechanical scan only — "
+                        "candidate missing access control; verify intended "
+                        "permissionlessness before treating as a real finding."),
+                    "impact": (
+                        "If access control is genuinely missing, any caller can "
+                        "mutate contract state via this function; if the "
+                        "function is intentionally permissionless, this is a "
+                        "false positive requiring no action."),
+                })
+        except Exception:
+            continue
+    return findings
+
+
+def _write_permissionless_setter_findings(scratch: Path, proj: Path) -> str:
+    """Write permissionless-setter findings to
+    niche_permissionless_setters_findings.md so the existing post-depth
+    niche-promotion path ingests them. Recall-safe / additive."""
+    try:
+        findings = compute_permissionless_setter_findings(proj)
+    except Exception as e:
+        _write_text(scratch / "niche_permissionless_setters_findings.md",
+                    f"# Permissionless Setters\n\n_skipped: {e}_\n")
+        return "SKIP"
+    if not findings:
+        _write_text(scratch / "niche_permissionless_setters_findings.md",
+                    "# Permissionless Setter Findings\n\n_None — every "
+                    "state-writing external/public function has a "
+                    "recognizable access gate._\n")
+        return "NONE"
+    lines = ["# Permissionless Setter Findings", "",
+             "Mechanical scan for external/public state-writing functions with "
+             "no recognizable access gate. Promoted via the niche path.", ""]
+    for fd in findings:
+        lines += [
+            f"### Finding [{fd['id']}]: {fd['title']}",
+            f"**Severity**: {fd['severity']}",
+            f"**Location**: {fd['location']}",
+            "**Preferred Tag**: [CODE-TRACE]",
+            f"**Description**: {fd['description']}",
+            f"**Impact**: {fd['impact']}",
+            "",
+        ]
+    _write_text(scratch / "niche_permissionless_setters_findings.md", "\n".join(lines) + "\n")
     return "WRITTEN"
 
 
@@ -932,8 +1143,14 @@ def _prepare_evm_build(root: Path) -> str:
           node_modules — e.g. `@openzeppelin/contracts`);
       (4) pre-install the pragma-detected solc via `svm` so an offline/stale
           version list does not break the build.
-    Bounded, idempotent, never raises — failures are advisory; the build is
-    still attempted afterward."""
+    Bounded, idempotent, never raises for its OWN dependency-prep steps —
+    failures there are advisory and the build is still attempted afterward.
+    EXCEPTION (ITEM H2): the fail-closed supply-chain gate below CAN raise
+    `SupplyChainAbortError` and is called BEFORE any install subprocess and
+    OUTSIDE the advisory try/except so it is never accidentally swallowed —
+    it is a deliberate, true circuit breaker. Callers must let it propagate
+    (do not silently continue installing dependencies after it fires)."""
+    gate_supply_chain(root)
     notes: List[str] = []
     try:
         # (1) git-submodule (forge) deps
@@ -3008,13 +3225,102 @@ def _detect_cosmos_markers(proj: Path) -> Tuple[bool, bool]:
     return cosmos, ibc
 
 
+def _seed_mechanical_flag(
+    scratch: Path,
+    *,
+    rows_to_flip: Dict[str, str],
+    flags: List[str],
+    detected_patterns_header: str,
+    detected_patterns_body: str,
+    summary_note: str,
+) -> None:
+    """Shared mechanical SECOND-CHANNEL skill dispatch (3 steps).
+
+    A deterministic backup to the LLM recon's flag detection: when a caller's
+    own mechanical marker scan finds a trigger, this helper (1) flips the
+    matching skill row(s) in `template_recommendations.md` to Required=YES,
+    (2) emits `flags` into `detected_patterns.md`, and (3) appends a
+    subsystem-flags line to `recon_summary.md` — so a skill still fires even
+    when the LLM recon pass misses the trigger. Mechanical + manifest-priority:
+    only rewrites pre-pass-owned files (those still carrying `_PREPASS_MARKER`);
+    enriched files are left untouched.
+
+    `rows_to_flip` maps skill name -> rationale phrase appended to that row's
+    Rationale column. `flags` is the ordered list of flag tokens to emit.
+    Callers own detection (whether to call this at all) and status-string
+    formatting (DETECTED/NOT_DETECTED/FAILED) — this helper unconditionally
+    performs the 3 writes.
+    """
+    # 1) Flip the relevant skill rows in template_recommendations.md to
+    #    Required=YES (only if the file is still pre-pass-owned).
+    tr = scratch / "template_recommendations.md"
+    if tr.exists():
+        head = _read_text(tr).split("\n", 1)[0]
+        if head == _PREPASS_MARKER:
+            body = _read_text_unmarked(tr)
+            new_lines = []
+            flipped = False
+            for line in body.splitlines():
+                matched_skill = next(
+                    (
+                        s
+                        for s in rows_to_flip
+                        if s in line and line.lstrip().startswith("|")
+                    ),
+                    None,
+                )
+                if matched_skill is not None:
+                    cols = line.split("|")
+                    # Row shape: | | `SKILL` | trigger | Required | Rationale | |
+                    # Find the Required column (the cell whose stripped/upper
+                    # value is NO or YES) and flip it, set rationale.
+                    for ci, cell in enumerate(cols):
+                        cval = cell.strip().strip("`").strip("*").upper()
+                        if cval in ("NO", "YES"):
+                            cols[ci] = " YES "
+                            # Rationale is the next non-trailing cell.
+                            if ci + 1 < len(cols) and cols[ci + 1].strip() not in ("", "|"):
+                                cols[ci + 1] = " " + rows_to_flip[matched_skill]
+                            flipped = True
+                            break
+                    line = "|".join(cols)
+                new_lines.append(line)
+            if flipped:
+                _force_overwrite_prepass(tr, "\n".join(new_lines) + "\n")
+
+    # 2) Emit flags into detected_patterns.md (create it if absent).
+    dp = scratch / "detected_patterns.md"
+    flag_block = (
+        f"\n## Flags (mechanical — {detected_patterns_header})\n"
+        + "".join(f"- `{f}`\n" for f in flags)
+        + "\n" + detected_patterns_body + "\n"
+    )
+    if dp.exists() and _read_text(dp).split("\n", 1)[0] == _PREPASS_MARKER:
+        _force_overwrite_prepass(dp, _read_text_unmarked(dp) + flag_block)
+    elif not dp.exists():
+        _write_text(
+            dp,
+            "# Detected Patterns\n\n[LLM TO ENRICH] Pre-pass stub.\n" + flag_block,
+        )
+
+    # 3) Append a subsystem-flags line to recon_summary.md so Phase 2
+    #    instantiation sees the flags (mirrors the DATA_AVAILABILITY pattern).
+    rs = scratch / "recon_summary.md"
+    if rs.exists() and _read_text(rs).split("\n", 1)[0] == _PREPASS_MARKER:
+        summary_line = (
+            "\n- **Subsystem Flags (mechanical)**: "
+            + ", ".join(flags)
+            + f" ({summary_note})\n"
+        )
+        _force_overwrite_prepass(rs, _read_text_unmarked(rs) + summary_line)
+
+
 def _seed_cosmos_flag(scratch: Path, proj: Path) -> str:
     """If Cosmos-SDK markers are present, mark COSMOS_SDK_MODULE_SAFETY Required=YES
     and emit COSMOS_SDK (and IBC) flags into the recon artifacts.
 
-    Mechanical + manifest-priority. Only rewrites pre-pass-owned files (those
-    still carrying `_PREPASS_MARKER`); enriched files are left untouched by
-    `_write_text`.
+    Thin caller of `_seed_mechanical_flag` — see that function for the shared
+    3-step mechanical dispatch this performs.
 
     Returns: DETECTED:COSMOS_SDK[,IBC] | NOT_DETECTED | FAILED:{reason}
     """
@@ -3025,10 +3331,8 @@ def _seed_cosmos_flag(scratch: Path, proj: Path) -> str:
 
         flags = ["COSMOS_SDK"] + (["IBC"] if ibc else [])
 
-        # 1) Flip the relevant skill rows in template_recommendations.md to
-        #    Required=YES (only if the file is still pre-pass-owned). COSMOS_SDK
-        #    always; COSMOS_IBC_SECURITY only when the IBC flag is present.
-        #    skill_name -> rationale phrase
+        # Flip COSMOS_SDK_MODULE_SAFETY always; COSMOS_IBC_SECURITY only when
+        # the IBC flag is present. skill_name -> rationale phrase.
         rows_to_flip = {
             "COSMOS_SDK_MODULE_SAFETY": (
                 "Cosmos-SDK / CometBFT framework detected in manifest "
@@ -3040,70 +3344,102 @@ def _seed_cosmos_flag(scratch: Path, proj: Path) -> str:
                 "IBC / ibc-go cross-chain integration detected in manifest "
                 "(mechanical). "
             )
-        tr = scratch / "template_recommendations.md"
-        if tr.exists():
-            head = _read_text(tr).split("\n", 1)[0]
-            if head == _PREPASS_MARKER:
-                body = _read_text(tr)
-                if body.startswith(_PREPASS_MARKER):
-                    body = body.split("\n", 1)[1] if "\n" in body else ""
-                new_lines = []
-                flipped = False
-                for line in body.splitlines():
-                    matched_skill = next(
-                        (
-                            s
-                            for s in rows_to_flip
-                            if s in line and line.lstrip().startswith("|")
-                        ),
-                        None,
-                    )
-                    if matched_skill is not None:
-                        cols = line.split("|")
-                        # Row shape: | | `SKILL` | trigger | Required | Rationale | |
-                        # Find the Required column (the cell whose stripped/upper
-                        # value is NO or YES) and flip it, set rationale.
-                        for ci, cell in enumerate(cols):
-                            cval = cell.strip().strip("`").strip("*").upper()
-                            if cval in ("NO", "YES"):
-                                cols[ci] = " YES "
-                                # Rationale is the next non-trailing cell.
-                                if ci + 1 < len(cols) and cols[ci + 1].strip() not in ("", "|"):
-                                    cols[ci + 1] = " " + rows_to_flip[matched_skill]
-                                flipped = True
-                                break
-                        line = "|".join(cols)
-                    new_lines.append(line)
-                if flipped:
-                    _force_overwrite_prepass(tr, "\n".join(new_lines) + "\n")
 
-        # 2) Emit flags into detected_patterns.md (create for L1 if absent).
-        dp = scratch / "detected_patterns.md"
-        flag_block = (
-            "\n## Flags (mechanical — Cosmos-SDK framework)\n"
-            + "".join(f"- `{f}`\n" for f in flags)
-            + "\nCosmos-SDK / CometBFT / Tendermint dependency detected in the "
-            "project manifest. Loads `cosmos-sdk-module-safety` into "
-            "depth-consensus-invariant and depth-state-trace.\n"
+        _seed_mechanical_flag(
+            scratch,
+            rows_to_flip=rows_to_flip,
+            flags=flags,
+            detected_patterns_header="Cosmos-SDK framework",
+            detected_patterns_body=(
+                "Cosmos-SDK / CometBFT / Tendermint dependency detected in the "
+                "project manifest. Loads `cosmos-sdk-module-safety` into "
+                "depth-consensus-invariant and depth-state-trace."
+            ),
+            summary_note="Cosmos-SDK / CometBFT framework detected in manifest",
         )
-        if dp.exists() and _read_text(dp).split("\n", 1)[0] == _PREPASS_MARKER:
-            _force_overwrite_prepass(dp, _read_text_unmarked(dp) + flag_block)
-        elif not dp.exists():
-            _write_text(
-                dp,
-                "# Detected Patterns\n\n[LLM TO ENRICH] Pre-pass stub.\n" + flag_block,
-            )
 
-        # 3) Append a subsystem-flags line to recon_summary.md so Phase 2
-        #    instantiation sees COSMOS_SDK (mirrors the DATA_AVAILABILITY pattern).
-        rs = scratch / "recon_summary.md"
-        if rs.exists() and _read_text(rs).split("\n", 1)[0] == _PREPASS_MARKER:
-            summary_line = (
-                "\n- **Subsystem Flags (mechanical)**: "
-                + ", ".join(flags)
-                + " (Cosmos-SDK / CometBFT framework detected in manifest)\n"
-            )
-            _force_overwrite_prepass(rs, _read_text_unmarked(rs) + summary_line)
+        return "DETECTED:" + ",".join(flags)
+    except Exception as e:
+        return f"FAILED:{e.__class__.__name__}"
+
+
+# ---------------------------------------------------------------------------
+# Cross-chain message-handler marker detection (SC, EVM)
+# ---------------------------------------------------------------------------
+#
+# Pure marker/import grep over production source — a low-false-positive
+# structural signal (a receiver/peer-registration function name), never a
+# named protocol's answer. When a cross-chain messaging entry point is found,
+# mechanically seed the CROSS_CHAIN_MSG flag so the CROSS_CHAIN_MESSAGE_
+# INTEGRITY skill is marked Required=YES, backing up the LLM recon's own flag
+# detection with a deterministic second channel (see skill-index.md).
+
+# Unique, low-false-positive receiver/registration function names for common
+# cross-chain messaging entry points (generic mechanism — illustrative only).
+_CROSS_CHAIN_MSG_MARKERS = (
+    "lzReceive",
+    "ccipReceive",
+    "receiveWormholeMessages",
+    "setPeer",
+    "setTrustedRemote",
+)
+
+
+def _detect_cross_chain_msg_markers(proj: Path) -> bool:
+    """Scan production `.sol` source for cross-chain message-handler markers.
+
+    Best-effort and non-fatal: any read failure is skipped, never raises.
+    Restricted to production source (test/mock/script/lib dirs excluded via
+    `_production_source_files`) to keep the signal low-false-positive.
+    """
+    try:
+        for p in _production_source_files(proj, (".sol",)):
+            text = _read_text(p)
+            if not text:
+                continue
+            if any(m in text for m in _CROSS_CHAIN_MSG_MARKERS):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _seed_cross_chain_msg_flag(scratch: Path, proj: Path) -> str:
+    """If cross-chain message-handler markers are present, mark
+    CROSS_CHAIN_MESSAGE_INTEGRITY Required=YES and emit the CROSS_CHAIN_MSG
+    flag into the recon artifacts.
+
+    Thin caller of `_seed_mechanical_flag` — see that function for the shared
+    3-step mechanical dispatch this performs.
+
+    Returns: DETECTED:CROSS_CHAIN_MSG | NOT_DETECTED | FAILED:{reason}
+    """
+    try:
+        if not _detect_cross_chain_msg_markers(proj):
+            return "NOT_DETECTED"
+
+        flags = ["CROSS_CHAIN_MSG"]
+        rows_to_flip = {
+            "CROSS_CHAIN_MESSAGE_INTEGRITY": (
+                "Cross-chain message-handler marker (lzReceive/ccipReceive/"
+                "receiveWormholeMessages/setPeer/setTrustedRemote) detected "
+                "in production source (mechanical). "
+            ),
+        }
+
+        _seed_mechanical_flag(
+            scratch,
+            rows_to_flip=rows_to_flip,
+            flags=flags,
+            detected_patterns_header="cross-chain message handler",
+            detected_patterns_body=(
+                "Cross-chain message-handler entry point (receiver or peer/"
+                "trusted-remote registration function) detected in production "
+                "source. Loads `cross-chain-message-integrity` into breadth "
+                "agents and depth-external."
+            ),
+            summary_note="cross-chain message-handler marker detected in production source",
+        )
 
         return "DETECTED:" + ",".join(flags)
     except Exception as e:
@@ -3230,6 +3566,9 @@ def run_recon_prepass(config: dict) -> Dict[str, str]:
                   lambda: _bake_evm_graph(scratch, proj))
             _safe("niche_interface_parity_findings.md",
                   lambda: _write_interface_parity_findings(scratch, proj))
+            # M2 (recall): permissionless-setter detector.
+            _safe("niche_permissionless_setters_findings.md",
+                  lambda: _write_permissionless_setter_findings(scratch, proj))
         # Pass the mechanical-graph bake result so EVM can dedupe the redundant
         # second compile: when Slither already compiled (source=slither), the
         # standalone forge build probe is derived-skipped instead of recompiling.
@@ -3279,6 +3618,13 @@ def run_recon_prepass(config: dict) -> Dict[str, str]:
     # flags. Manifest-priority, non-fatal.
     if pipeline == "l1":
         _safe("cosmos_flag", lambda: _seed_cosmos_flag(scratch, proj))
+
+    # SC (EVM): mechanical cross-chain message-handler marker detection —
+    # second-channel backup to the LLM recon's own CROSS_CHAIN_MSG flag
+    # detection. Same manifest-priority 3-step dispatch as cosmos_flag above,
+    # via the shared _seed_mechanical_flag helper.
+    if pipeline != "l1" and lang == "evm":
+        _safe("cross_chain_msg_flag", lambda: _seed_cross_chain_msg_flag(scratch, proj))
 
     # v2.5.0 P2: OpenGrep cross-ecosystem scanner (SC pipelines only).
     # Deferred to the driver pre-breadth hook by default (see run_startup_scanners

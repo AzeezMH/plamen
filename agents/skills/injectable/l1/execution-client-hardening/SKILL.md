@@ -107,6 +107,67 @@ For Go clients, memory safety is largely on the runtime. For Rust clients (reth,
 
 Interaction with `rust-unsafe-audit` skill.
 
+## 5b. Interned/Compacted Identity Coherence
+
+**Trigger**: The code assigns a compact numeric index or handle to a named
+entity (a type, account, resource, module, or similar) — typically to avoid
+storing the full name/key repeatedly — and one or more OTHER structures cache
+data derived from that entity, keyed by the compact index rather than by the
+entity's original identity. Common in interning tables, symbol/type caches,
+and any "intern this name once, refer to it by a small integer afterward"
+optimization (for example, a Move VM-style loader that interns module/type
+identities into a numeric table).
+
+**Why this is structurally distinct from §8's cache lifecycle set-cover**:
+§8 concerns a SINGLE bounded cache whose OWN entries go stale or grow
+unbounded. This section concerns MULTIPLE structures that share one index/
+handle space, where one structure can be reset/compacted while a SIBLING
+structure — keyed by the same index space — is not, so a recycled index
+silently points a stale consumer at a different entity's data. This is an
+asymmetric-invalidation bug across coupled structures, not a single eviction
+policy gap, and set-cover on one structure's legs will not catch it.
+
+**Methodology**:
+
+1. **Enumerate every structure keyed by the index/handle space** — not just
+   the primary interning map. Grep for the index type's name (e.g. a
+   `TypeIndex`, `ModuleHandle`, or similar newtype) across the codebase and
+   list every map/vector/cache that uses it as a key, not just the one that
+   assigns it.
+2. **For every reset / flush / compact / GC path on ANY of those structures**,
+   verify that ALL of them are invalidated together, in the SAME atomic step.
+   A reset that clears the primary interning table but leaves a derived cache
+   populated (or vice versa) is the bug.
+3. **Check whether index/handle assignment can restart from a low or
+   previously-used value after a partial reset** (e.g. a counter reset to 0,
+   or a freelist that recycles slots). If assignment can produce a value that
+   used to belong to a different entity, and any sibling structure still holds
+   an entry under that recycled value, a lookup now silently resolves to the
+   WRONG entity's data instead of erroring.
+4. **Trace whether any derived identity is computed by looking up the
+   recycled index in a structure that is NOT part of the reset** — e.g. a
+   storage/lookup key, a resource type, or a permission/capability scope
+   derived by indexing into a stale sibling structure. This is the concrete
+   exploitation mechanism: the recycled index doesn't just serve stale bytes,
+   it makes the system compute a DIFFERENT identity than the one the caller
+   intended (structurally analogous to a native-vs-wrapped token mixup, where
+   the same numeric handle is silently resolved against the wrong underlying
+   asset).
+
+**Required check**: for the primary index/handle-assigning structure and every
+sibling structure found in step 1, confirm they are reset by the SAME
+function/transaction boundary, not by independently-triggered paths. Two
+reset paths that are supposed to stay in lockstep but are invoked from
+different call sites are a red flag even if both eventually run.
+
+Tag: `[IDENTITY-COHERENCE:{index-space}:{structures-affected}]`
+
+Severity baseline: High to Critical when the recycled index can be attacker-
+influenced (attacker controls timing/ordering of the partial reset and the
+next allocation) and the derived identity affects storage/permission
+resolution; Medium when reachable only through operator/admin-triggered
+resets.
+
 ## 6. Cross-Client Consistency (for forks and alt-clients)
 
 If the target is a fork of an upstream execution client:

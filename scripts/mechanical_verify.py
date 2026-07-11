@@ -48,6 +48,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
+# ITEM H2: fail-closed supply-chain gate — sibling module, stdlib only. Called
+# before the per-finding test loop (which runs the TARGET repo's own
+# forge/cargo/... commands) so a poisoned dependency lockfile cannot execute
+# an install-time payload via the pre-warm build or the tests themselves. The
+# module import (not just the two names) is kept too so tests can reach
+# `supply_chain_gate.DEFAULT_IOC_DENYLIST` / `_call_offline_scanner` through
+# this module's namespace for monkeypatching.
+import supply_chain_gate
+from supply_chain_gate import SupplyChainAbortError, gate_supply_chain
+
 
 # Per-file and per-phase budgets (overridable via env for ops scenarios).
 _DEFAULT_PER_TEST_TIMEOUT_S = int(os.environ.get("PLAMEN_MECH_VERIFY_TIMEOUT", "180"))
@@ -139,6 +149,8 @@ def _ensure_l1_registry_entries(reg: dict) -> None:
             "build_command": "cargo build --all-targets",
             "test_command": "cargo test {test_function} -- --nocapture",
             "test_filter_mode": "cargo_name_filter",
+            "test_prewarm_command": "cargo test --no-run",
+            "features": [],
             "evidence_tags": ["POC-PASS", "POC-FAIL", "CODE-TRACE"],
             "fuzz_engines": [],
         }
@@ -424,34 +436,99 @@ def _find_build_root(project_root: Path, language: str) -> Path:
 # ---------------------------------------------------------------------------
 
 
+_RGLOB_MAX_DEPTH = 6
+
+
+def _bounded_rglob_unique(root: Path, name: str,
+                         max_depth: int = _RGLOB_MAX_DEPTH) -> Optional[Path]:
+    """Search for a uniquely-named file under root, bounded by directory
+    depth and result count.
+
+    Prunes common non-source directories (`_BUILD_SCAN_SKIP_DIRS`) DURING the
+    walk (not just after) so a huge `target/`/`node_modules/` subtree can't
+    blow up traversal cost, and stops descending past `max_depth`. Returns the
+    sole match, or None on 0 or >=2 matches (ambiguous — never guess a
+    resolution the verifier didn't actually run against) or any OSError.
+    """
+    try:
+        root_resolved = Path(root).resolve()
+        if not root_resolved.is_dir():
+            return None
+    except OSError:
+        return None
+    base_depth = len(root_resolved.parts)
+    matches: list[Path] = []
+    try:
+        for dirpath, dirnames, filenames in os.walk(str(root_resolved)):
+            depth = len(Path(dirpath).parts) - base_depth
+            if depth >= max_depth:
+                dirnames[:] = []  # stop descending further
+                continue
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in _BUILD_SCAN_SKIP_DIRS and not d.startswith(".")
+            ]
+            if name in filenames:
+                matches.append(Path(dirpath) / name)
+                if len(matches) > 1:
+                    return None  # ambiguous, short-circuit
+    except OSError:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
 def _resolve_test_path_for(probe, build_root: Path,
                           project_root: Optional[Path] = None) -> Optional[Path]:
     """Resolve a test file path under the build root, trying multiple anchors.
 
     Tries the build root first (where `test/` normally lives), then the
-    narrower audit scope dir as a fallback.
+    narrower audit scope dir as a fallback. Anchors tried per root, in order:
+      1. the raw captured path verbatim (works once the cargo test-path regex
+         captures "<crate-dir>/tests/foo.rs" and that literally matches a
+         workspace member directory under the root);
+      2. the bare basename under common test-dir conventions (`test/`,
+         `tests/`, `src/`, `sources/tests/`, `trident-tests/`);
+      3. a crate-prefix reconstruction: the raw path with its FIRST segment
+         stripped, in case the captured crate-dir prefix doesn't line up 1:1
+         with the on-disk member (deeper nesting, differently-named dir);
+      4. LAST RESORT (all roots exhausted): a bounded, unique-match-only
+         rglob(basename) search — trusted ONLY when it finds exactly one
+         file. 0 or >1 matches means "don't guess" -> None (NO_TEST_FILE).
     """
     if not probe.test_file_resolved:
         return None
-    raw = probe.test_file_resolved
-    name = Path(raw.replace("\\", "/")).name
+    raw = probe.test_file_resolved.replace("\\", "/")
+    name = Path(raw).name
     roots = [build_root]
     if project_root is not None and Path(project_root).resolve() != Path(build_root).resolve():
         roots.append(Path(project_root))
+
+    parts = Path(raw).parts
+    tail = Path(*parts[1:]) if len(parts) > 2 else None
+
     for root in roots:
-        for c in (
+        candidates = [
             root / raw,
             root / name,
             root / "test" / name,
             root / "tests" / name,
+            root / "src" / name,
             root / "sources" / "tests" / name,
             root / "trident-tests" / name,
-        ):
+        ]
+        if tail is not None:
+            candidates.append(root / tail)
+        for c in candidates:
             try:
                 if c.exists() and c.is_file():
                     return c
             except OSError:
                 continue
+
+    for root in roots:
+        found = _bounded_rglob_unique(root, name)
+        if found is not None:
+            return found
     return None
 
 
@@ -538,30 +615,138 @@ _CARGO_BOGUS_FILTER = frozenset(
     {"test", "tests", "mod", "lib", "main", "src", "it", "unit", "integration"})
 
 
-def _resolve_cargo_package(probe) -> Optional[str]:
+def _resolve_cargo_package(probe, resolved: Optional[Path] = None,
+                          build_root: Optional[Path] = None) -> Optional[str]:
     """Recover the `-p <package>` the verifier's PoC ran under (mirrors
     `_resolve_foundry_profile` for EVM).
 
     The registry cargo template carries no package selector, so on a multi-member
     workspace (e.g. `contracts/registry`, `contracts/factory`, …) the mechanical
     re-run executes at the workspace root and cannot resolve a member's test →
-    mass NO_TEST_FILE/FAIL, and every `[POC-PASS]` fails to graduate. The
-    verifier records its working command (`cargo test -p <pkg> …`); read the
-    package back from it. Returns the package name, or None."""
+    mass NO_TEST_FILE/FAIL, and every `[POC-PASS]` fails to graduate.
+
+    Resolution order:
+      1. `-p <pkg>` / `--package <pkg>` explicitly recorded in the verifier's
+         Command field (read back verbatim from `probe.test_command`).
+      2. `probe.package` — the same Command field, parsed once by the spike
+         parser's Command-hint extraction (a fallback for a flag spelling the
+         regex above misses, e.g. `--package=foo`).
+      3. The workspace-member directory name: the FIRST path segment of the
+         RESOLVED test file relative to the build root. Only used when it is
+         not a bogus generic directory name (`tests`, `src`, …) — a plain
+         `tests/foo.rs` sitting directly at the workspace root has no member
+         segment to give.
+    Returns the package name, or None."""
     cmd = getattr(probe, "test_command", "") or ""
     m = _CARGO_PKG_RE.search(cmd)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    hint = getattr(probe, "package", None)
+    if hint:
+        return hint
+    if resolved is not None and build_root is not None:
+        try:
+            rel = Path(resolved).resolve().relative_to(Path(build_root).resolve())
+        except (ValueError, OSError):
+            rel = None
+        if rel is not None and len(rel.parts) > 1:
+            member = rel.parts[0]
+            if member.lower() not in _CARGO_BOGUS_FILTER and member not in _BUILD_SCAN_SKIP_DIRS:
+                return member
+    return None
 
 
-def _apply_cargo_workspace_fixups(argv: list, probe) -> list:
-    """Repair the two mechanical-cargo mis-reconstructions that made every
+# Feature-validity gate: cargo hard-errors ("package X does not contain this
+# feature: Y") whenever a `--features Y` names a feature the target package does
+# not DECLARE in its own `[features]` table. Soroban contract crates commonly
+# declare NO features and obtain testutils APIs via
+# `soroban-sdk = { features=["testutils"] }` (available under cfg(test) with no
+# crate-level flag) — so blindly unioning the registry-default `testutils` fails
+# the whole invocation, including tests that pass without any feature flag. We
+# therefore only emit a feature the resolved package actually declares.
+_PKG_FEATURES_CACHE: dict = {}
+_TOML_SECTION_RE = re.compile(r"(?m)^\s*\[[^\]]+\]\s*$")
+_CARGO_FEAT_KEY_RE = re.compile(r"(?m)^\s*([A-Za-z0-9_][A-Za-z0-9_-]*)\s*=")
+
+
+def _toml_section_block(text: str, header_re: re.Pattern) -> str:
+    m = header_re.search(text)
+    if not m:
+        return ""
+    start = m.end()
+    nxt = _TOML_SECTION_RE.search(text, start)
+    return text[start:(nxt.start() if nxt else len(text))]
+
+
+def _cargo_toml_package_name(text: str) -> Optional[str]:
+    block = _toml_section_block(text, re.compile(r"(?m)^\s*\[package\]\s*$"))
+    nm = re.search(r'(?m)^\s*name\s*=\s*"([^"]+)"', block)
+    return nm.group(1) if nm else None
+
+
+def _cargo_toml_declared_features(text: str) -> set:
+    block = _toml_section_block(text, re.compile(r"(?m)^\s*\[features\]\s*$"))
+    return set(_CARGO_FEAT_KEY_RE.findall(block)) if block else set()
+
+
+def _workspace_package_features(build_root: Optional[Path]) -> dict:
+    """Map every workspace member's package name -> the set of features it
+    DECLARES in its own `[features]` table (empty set when it declares none).
+    Bounded Cargo.toml scan under build_root, cached per build_root. Never raises.
+    """
+    if not build_root:
+        return {}
+    try:
+        key = str(Path(build_root).resolve())
+    except Exception:
+        return {}
+    cached = _PKG_FEATURES_CACHE.get(key)
+    if cached is not None:
+        return cached
+    out: dict = {}
+    try:
+        n = 0
+        for ct in Path(build_root).rglob("Cargo.toml"):
+            if any(p in _BUILD_SCAN_SKIP_DIRS for p in ct.parts):
+                continue
+            n += 1
+            if n > 800:
+                break
+            try:
+                txt = ct.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            name = _cargo_toml_package_name(txt)
+            if name:
+                out[name] = _cargo_toml_declared_features(txt)
+    except Exception:
+        pass
+    _PKG_FEATURES_CACHE[key] = out
+    return out
+
+
+def _apply_cargo_workspace_fixups(argv: list, probe, language: Optional[str] = None,
+                                 resolved: Optional[Path] = None,
+                                 build_root: Optional[Path] = None) -> list:
+    """Repair the mechanical-cargo mis-reconstructions that made every
     workspace-member Soroban/Rust PoC read as NO_TEST_FILE/FAIL:
       (1) thread the verifier's `-p <package>` back in (registry template omits
-          it), so a workspace-member test resolves;
+          it, and it is derivable from the resolved test path's workspace-member
+          segment even when the verifier's Command didn't record one), so a
+          workspace-member test resolves — WITHOUT descending `cwd` into the
+          member (stays at the workspace root, per _run_test_for_finding);
       (2) drop a phantom `<generic> -- --exact` filter when the substituted test
           name is a non-test token (e.g. `test` extracted from `test.rs`) — run
           the package suite as the verifier actually did, instead of
-          `--exact test` which matches nothing.
+          `--exact test` which matches nothing;
+      (3) reconcile `--features` as a UNION of the registry template's own
+          default feature set, whatever the verifier's recorded Command named,
+          and the probe's parsed feature hints — instead of silently STRIPPING
+          the registry default (e.g. Soroban's `testutils`) whenever the
+          verifier's Command happened not to repeat it, which broke compiling
+          any `#[cfg(feature = "testutils")]`-gated test module. `testutils`
+          is never emitted for solana/l1_rust (soroban-only feature; those
+          registry templates never define it).
     Never raises; returns argv unchanged on any parse issue."""
     try:
         out = list(argv)
@@ -588,28 +773,53 @@ def _apply_cargo_workspace_fixups(argv: list, probe) -> list:
             del out[sep:]              # drop `-- --exact …` (substring is isolation)
             if bogus and filt_idx is not None:
                 del out[filt_idx]      # also drop the bogus filter → package suite
-        # (3) reconcile `--features` with the verifier's recorded command: the
-        # registry template hardcodes `--features testutils`, but not every
-        # workspace member DEFINES that feature (cargo hard-errors "does not
-        # contain this feature"). Mirror exactly what the verifier ran.
-        rec = getattr(probe, "test_command", "") or ""
-        rec_feat = re.search(r"--features(?:[=\s]+)(\S+)", rec)
+        # (3) Union the registry template's own default `--features` (if any),
+        # the verifier's recorded Command `--features`, and the probe's parsed
+        # feature hints. NEVER let one side's absence erase another side's
+        # presence — that is the exact bug that used to strip `testutils`
+        # whenever the verifier's Command happened not to repeat it (not every
+        # workspace member DEFINES that feature either, so `testutils` is
+        # filtered out for solana/l1_rust below).
+        lang = (language or "").lower().strip()
+        default_feat = None
         if "--features" in out:
             fi = out.index("--features")
-            if rec_feat and fi + 1 < len(out):
-                out[fi + 1] = rec_feat.group(1)   # use verifier's feature set
-            elif fi + 1 < len(out):
-                del out[fi:fi + 2]                # verifier used none → strip
+            if fi + 1 < len(out):
+                default_feat = out[fi + 1]
+                del out[fi:fi + 2]
             else:
                 del out[fi:fi + 1]
-        elif rec_feat:
+        rec = getattr(probe, "test_command", "") or ""
+        rec_feat_m = re.search(r"--features(?:[=\s]+)(\S+)", rec)
+        rec_feats = rec_feat_m.group(1).split(",") if rec_feat_m else []
+        probe_feats = list(getattr(probe, "features", None) or [])
+        union: list = []
+        for f in ([default_feat] if default_feat else []) + rec_feats + probe_feats:
+            f = (f or "").strip()
+            if not f:
+                continue
+            if lang in ("solana", "l1_rust") and f == "testutils":
+                continue  # soroban-only feature; never emit for these ecosystems
+            if f not in union:
+                union.append(f)
+        # (1) resolve the target package FIRST — feature validity is per-package.
+        pkg = _resolve_cargo_package(probe, resolved, build_root)
+        # Feature-validity gate: keep only features the resolved package actually
+        # DECLARES in its own [features] table; drop the rest (incl. the
+        # registry-default testutils) rather than emit an invalid `--features`
+        # that fails the entire invocation. A crate with no [features] (the common
+        # Soroban case) → all dropped → runs exactly as the PASSing PoCs did.
+        if union:
+            declared = (_workspace_package_features(build_root).get(pkg, set())
+                        if (pkg and build_root is not None) else set())
+            union = [f for f in union if f in declared]
+        if union:
             try:
                 ti2 = out.index("test")
-                out[ti2 + 1:ti2 + 1] = ["--features", rec_feat.group(1)]
+                out[ti2 + 1:ti2 + 1] = ["--features", ",".join(union)]
             except ValueError:
-                out.extend(["--features", rec_feat.group(1)])
-        # (1) inject `-p <pkg>` right after the `test` subcommand if absent.
-        pkg = _resolve_cargo_package(probe)
+                out.extend(["--features", ",".join(union)])
+        # inject `-p <pkg>` right after the `test` subcommand if absent.
         has_pkg = any(
             t in ("-p", "--package") or t.startswith("--package=") for t in out)
         if pkg and not has_pkg:
@@ -724,6 +934,7 @@ def _run_test_for_finding(verify_path: Path, build_root: Path, language: str,
         try:
             proc = subprocess.run(
                 cmd, cwd=str(build_root), capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=per_test_timeout_s, shell=False, env=env,
             )
             result.duration_s = time.time() - t0
@@ -756,7 +967,8 @@ def _run_test_for_finding(verify_path: Path, build_root: Path, language: str,
     # drop a phantom generic `--exact` filter, so a workspace-member PoC is
     # resolvable (RC-harness, mirrors the EVM FOUNDRY_PROFILE fix).
     if language in ("solana", "soroban", "l1_rust"):
-        cmd = _apply_cargo_workspace_fixups(cmd, probe)
+        cmd = _apply_cargo_workspace_fixups(
+            cmd, probe, language=language, resolved=resolved, build_root=build_root)
 
     # Resolve binary path (handles Windows .cmd / .exe shims)
     bin_path = shutil.which(cmd[0])
@@ -770,6 +982,8 @@ def _run_test_for_finding(verify_path: Path, build_root: Path, language: str,
             cwd=str(build_root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=per_test_timeout_s,
             shell=False,
         )
@@ -1340,6 +1554,22 @@ def read_verdict_manifest(scratchpad: Path) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _lang_cfg_from_registry(registry: dict, language: str) -> dict:
+    """Registry may be the full document (`{"languages": {...}}`, what
+    `_load_registry()` returns) or, in unit tests and some callers, a flat
+    `{language: {...}}` mapping passed directly. Support both shapes so
+    production callers and existing test stubs both resolve correctly —
+    the prior direct `registry.get(language)` silently returned `{}` for
+    every non-EVM language when handed the real nested document, which made
+    the cargo pre-warm step below unreachable in production."""
+    if not isinstance(registry, dict):
+        return {}
+    langs = registry.get("languages")
+    if isinstance(langs, dict) and language in langs:
+        return langs.get(language) or {}
+    return registry.get(language) or {}
+
+
 def _prewarm_build(build_root: Path, language: str, registry: dict,
                    timeout_s: int) -> tuple[bool, str]:
     """One-time best-effort compile from the build root to WARM the build cache
@@ -1351,15 +1581,22 @@ def _prewarm_build(build_root: Path, language: str, registry: dict,
     [CODE-TRACE] instead of [POC-PASS]. A warm cache makes each subsequent test
     an incremental (seconds) build.
 
+    Cargo ecosystems (solana/soroban/l1_rust) ALSO get a second, independent
+    `cargo test --no-run` warm pass (see `_prewarm_cargo_test_targets`): the
+    primary `build_command` (e.g. `cargo build-sbf`, `stellar contract build`)
+    compiles the library/program target only, not the *test* targets, so the
+    per-finding loop's first `cargo test` still paid a cold test-compile even
+    with a warm library cache.
+
     Best-effort and NON-FATAL: any failure/timeout just leaves the cache as-is
     and the loop proceeds exactly as before (the per-test build then behaves as
     it did pre-fix). Never raises."""
+    env = os.environ.copy()
     try:
-        env = os.environ.copy()
         if language == "evm":
             cmd = [shutil.which("forge") or "forge", "build"]
         else:
-            lang_cfg = registry.get(language) or {}
+            lang_cfg = _lang_cfg_from_registry(registry, language)
             build_cmd = str(lang_cfg.get("build_command") or "").strip()
             if not build_cmd:
                 return (False, f"no build_command for '{language}' — pre-warm skipped")
@@ -1370,19 +1607,75 @@ def _prewarm_build(build_root: Path, language: str, registry: dict,
         t0 = time.time()
         proc = subprocess.run(
             cmd, cwd=str(build_root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=max(1, int(timeout_s)), shell=False, env=env,
         )
         dt = time.time() - t0
         if proc.returncode == 0:
-            return (True, f"warm ok (rc=0) in {dt:.0f}s")
-        # A non-zero build here is informative but not fatal — the per-test run
-        # still tries (a scoped compile can succeed where a whole-project one
-        # fails), and the classifier handles COMPILE_FAIL.
-        return (False, f"build rc={proc.returncode} in {dt:.0f}s (cache left as-is)")
+            ok, note = True, f"warm ok (rc=0) in {dt:.0f}s"
+        else:
+            # A non-zero build here is informative but not fatal — the per-test
+            # run still tries (a scoped compile can succeed where a
+            # whole-project one fails), and the classifier handles COMPILE_FAIL.
+            ok, note = False, f"build rc={proc.returncode} in {dt:.0f}s (cache left as-is)"
     except subprocess.TimeoutExpired:
-        return (False, f"pre-warm build exceeded {timeout_s}s (cache left as-is)")
+        ok, note = False, f"pre-warm build exceeded {timeout_s}s (cache left as-is)"
     except Exception as exc:  # never let cache-warming break verification
-        return (False, f"pre-warm build error: {exc}")
+        ok, note = False, f"pre-warm build error: {exc}"
+
+    if language in ("solana", "soroban", "l1_rust"):
+        ok2, note2 = _prewarm_cargo_test_targets(build_root, language, registry, timeout_s, env)
+        note = f"{note}; {note2}"
+        # A failed/absent test-prewarm never overrides a successful primary
+        # build — it is a pure best-effort supplement, never fatal.
+        ok = ok or ok2
+
+    return (ok, note)
+
+
+def _prewarm_cargo_test_targets(build_root: Path, language: str, registry: dict,
+                                timeout_s: int, env: dict) -> tuple[bool, str]:
+    """Best-effort `cargo test --no-run` warm pass (see `_prewarm_build`).
+
+    Uses the registry's `test_prewarm_command` when present, else a plain
+    `cargo test --no-run`; `--features testutils` is added for soroban only
+    (its test modules are commonly gated behind that feature — solana/l1_rust
+    never define it). No `-p <crate>` is threaded here: at this point in the
+    phase no finding has been parsed yet, so there is no specific workspace
+    member to target — this warms whatever `cargo test --no-run` reaches from
+    the workspace root, best-effort. Per-finding `-p` threading happens later
+    in `_apply_cargo_workspace_fixups`. Independent of the primary build step
+    — attempted even when it failed, since a scoped test-target compile can
+    succeed on its own. Never raises."""
+    try:
+        lang_cfg = _lang_cfg_from_registry(registry, language)
+        template = str(lang_cfg.get("test_prewarm_command") or "cargo test --no-run").strip()
+        cmd = template.split() or ["cargo", "test", "--no-run"]
+        resolved = shutil.which(cmd[0])
+        if resolved:
+            cmd[0] = resolved
+        # No unconditional `--features testutils`: this warm runs at the workspace
+        # ROOT with no `-p`, where a crate-level feature the members do not DECLARE
+        # (the common Soroban case — testutils arrives via the soroban-sdk dep, not
+        # a crate feature) makes cargo hard-error ("does not contain this feature"
+        # / "--features not allowed in the root of a virtual workspace"), wasting
+        # the whole warm pass. Plain `cargo test --no-run` compiles every member's
+        # test target and warms the cache; per-finding feature validity is handled
+        # later in `_apply_cargo_workspace_fixups`.
+        t0 = time.time()
+        proc = subprocess.run(
+            cmd, cwd=str(build_root), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=max(1, int(timeout_s)), shell=False, env=env,
+        )
+        dt = time.time() - t0
+        if proc.returncode == 0:
+            return (True, f"test-prewarm ok (rc=0) in {dt:.0f}s")
+        return (False, f"test-prewarm rc={proc.returncode} in {dt:.0f}s (best-effort, ignored)")
+    except subprocess.TimeoutExpired:
+        return (False, f"test-prewarm exceeded {timeout_s}s (best-effort, ignored)")
+    except Exception as exc:
+        return (False, f"test-prewarm error (best-effort, ignored): {exc}")
 
 
 def run_phase5b_mechanical_verify(scratchpad: Path, project_root: Path,
@@ -1401,8 +1694,15 @@ def run_phase5b_mechanical_verify(scratchpad: Path, project_root: Path,
         "elapsed_s": float,
       }
 
-    Never raises. Phase failure is captured in the returned status; the driver
-    chooses to mark the phase DEGRADED (warning) rather than HALT.
+    Never raises for its OWN execution logic — phase failure is captured in
+    the returned status, and the driver marks the phase DEGRADED (warning)
+    rather than HALT. EXCEPTION (ITEM H2): the fail-closed supply-chain gate
+    called before the per-finding test loop CAN raise
+    `supply_chain_gate.SupplyChainAbortError`. That is deliberate — it is a
+    true circuit breaker and must propagate so the per-finding subprocess
+    loop (which runs the TARGET repo's own build/test commands) never
+    starts. The driver's phase try/except catches it like any other phase
+    exception and marks this phase degraded without halting the pipeline.
     """
     per_test_timeout_s = per_test_timeout_s or _DEFAULT_PER_TEST_TIMEOUT_S
     phase_budget_s = phase_budget_s or _DEFAULT_PHASE_BUDGET_S
@@ -1455,6 +1755,15 @@ def run_phase5b_mechanical_verify(scratchpad: Path, project_root: Path,
     build_root = _read_recon_build_root(scratchpad, lang) or _find_build_root(
         Path(project_root), lang
     )
+
+    # ITEM H2: fail-closed supply-chain gate. Runs ONCE for the whole phase,
+    # BEFORE the pre-warm build and BEFORE the per-finding test loop below —
+    # both invoke the TARGET repo's own build/test toolchain against its
+    # dependency lockfile(s). A true circuit breaker: this call is NOT
+    # wrapped in a try/except here, so a raised SupplyChainAbortError
+    # propagates out of this function immediately and neither the pre-warm
+    # build nor a single per-finding test subprocess runs.
+    gate_supply_chain(build_root)
 
     # Warm the build cache ONCE before the per-finding loop. A cold, dependency-
     # heavy (`--via-ir`) repo cannot compile inside a single per-test budget, so
