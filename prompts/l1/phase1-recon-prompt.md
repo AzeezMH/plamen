@@ -321,6 +321,49 @@ Enumerate external dependencies with security implications:
 
 For each, record: version, last-updated, known CVEs, cross-reference with `dependency-audit-nodeclient` skill. Write to `integration_points.md`.
 
+**Generic widening (EXTERNAL_DEPENDENCY, non-brand mechanical trigger)**: the
+5 categories above are a fixed, closed list and miss any OTHER external
+crate/package/module the client depends on. Also flag `EXTERNAL_DEPENDENCY`
+(alias: also sets `NAMED_EXTERNAL_PROTOCOL`, kept for parity with the SC
+pipelines' ledger format) for ANY imported dependency where: (a) its
+implementation is NOT vendored in-repo, (b) it is NOT part of the language's
+own standard library, AND (c) its return value/output is consumed on a
+security-relevant path (validation, signature/hash verification, state
+transition, message/block parsing). This is structural, never a specific
+crate name — the point is to catch dependencies outside the 5 named
+categories, not to re-list more brands.
+
+### External Dependency Research Ledger (MANDATORY)
+
+You are the ONLY phase with live WebSearch AND full attack-surface knowledge
+of every external dependency. depth-phase workers (`depth-consensus-invariant`,
+`depth-network-surface`, `depth-external`, etc.) run with
+`--disallowedTools mcp__*` and no live web tools — they can only READ the
+ledger you bake here. Do the research now, not later.
+
+For EVERY dependency flagged above (named category or generic
+`EXTERNAL_DEPENDENCY`), write one row to
+`{SCRATCHPAD}/external_dependency_research.md`:
+
+| Dependency | Integration Surface | Assumed Behavior | Real Behavior | Source | Conformance | Fetch Status |
+|------------|----------------------|-------------------|-----------------|--------|-------------|---------------|
+
+- **Dependency**: crate/package/module name.
+- **Integration Surface**: ALL call sites, `file:line`, comma-separated.
+- **Assumed Behavior**: what the calling code assumes, as coded.
+- **Real Behavior**: researched real semantics (WebSearch — release notes,
+  changelogs, known-CVE advisories, upstream docs).
+- **Source**: URL + fetch date (`fetched {DATE}`).
+- **Conformance**: `MATCH` / `MISMATCH` (flag for depth) / `CHECK`.
+- **Fetch Status**: `OK`, or `FETCH_FAILED:{reason}`.
+
+**Never drop a row.** A failed lookup still gets a row with `Fetch Status:
+FETCH_FAILED:{reason}` and `Conformance: CHECK` — carried forward, never
+silently omitted.
+
+Write to `{SCRATCHPAD}/external_dependency_research.md`. If NO dependencies
+are in scope, still write the file with only the header row.
+
 ## TASK 6: Bake validation [Agent L1-3]
 
 Read `{scratchpad}/primitive_status.md` from Phase 0.5. Verify:

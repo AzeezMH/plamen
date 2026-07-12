@@ -35,6 +35,34 @@ try:
 except Exception:  # pragma: no cover
     _inventory_blocks = None  # type: ignore
 
+try:
+    from plamen_mechanical import _field_from_markdown  # type: ignore
+except Exception:  # pragma: no cover
+    _field_from_markdown = None  # type: ignore
+
+__all__ = [
+    # Axis 1 (co-reference) — G1/G2, unchanged.
+    "compute_enumeration_obligations",
+    "compute_coverage_gaps",
+    "validate_enumeration_coverage",
+    # Additional mechanical obligation-derivers (L-04/L-08/L-10, M1).
+    "compute_critical_asset_mover_candidates",
+    "compute_array_uniqueness_candidates",
+    "compute_unbounded_input_candidates",
+    "compute_invariant_assertion_candidates",
+    "compute_hot_function_set",
+    "compute_axis_coverage_gaps",
+    "promote_axis_findings_to_inventory",
+    "promote_enumgap_exploration_to_inventory",
+    # Driver entry point (all axes + derivers).
+    "run_enumeration_gate",
+    # Gate V (Fix A) — 3-axis Variant-Family Coverage.
+    "compute_boundary_input_candidates",
+    "compute_symmetric_operation_candidates",
+    "compute_variant_gaps",
+    "validate_variant_coverage",
+]
+
 # Bounds (mirror chain_prep's recall-safe bounding so the gate can't flood).
 _MAX_VARS_PER_FINDING = 5      # only the few symbols a finding most directly touches
 _MAX_COREFS_PER_VAR = 6       # cap co-referencers enumerated per symbol
@@ -818,6 +846,333 @@ def compute_unbounded_input_candidates(scratchpad: Path) -> list:
         return out
     except Exception:
         return []
+
+
+# ── GATE V — 3-axis Variant-Family Coverage (Fix A, sibling/variant miss) ────
+# The co-reference gate above (G1/G2) enumerates ONE axis: functions that
+# share a state symbol. The dominant recall-miss class is broader: an agent
+# confirms a defect on one function and never checks structurally-parallel
+# LEGS of the same operation family (a checked deposit(), an unchecked
+# withdraw(); a checked setFoo(), four unchecked sibling setters). Gate V adds
+# two more mechanical axes, reusing this module's bounds (`_MAX_PER_DERIVER`)
+# and the append-only, idempotent, low-confidence `_emit_candidates` path —
+# nothing here is new infrastructure, only two new obligation SHAPES:
+#
+#   Axis 2 (boundary-input): a CONFIRMED/PARTIAL finding whose enclosing
+#     function takes a numeric/collection/address parameter must have
+#     addressed the boundary set {0, 1, min, MAX, empty, self} in its own
+#     prose. A boundary never named -> one VARGAP candidate per boundary.
+#     Degrades to a no-op when the graph/source parse lacks param-type info
+#     for that finding's language (recall-neutral, never a wrong-positive).
+#   Axis 3 (symmetric-operation): chain_prep's already-computed
+#     `chain_candidate_pairs.md` (STATE/TYPE pairs — READ-ONLY reuse, no
+#     edits to chain_prep.py here) identifies structurally-paired operations
+#     via shared state/type/discovery signal. A CONFIRMED/PARTIAL defect on
+#     one leg whose paired leg is NOT itself CONFIRMED/PARTIAL is an
+#     unaddressed sibling leg -> one VARGAP for that leg.
+#
+# Axis 1 (co-reference, G1/G2 above) is UNCHANGED — same functions, same
+# bounds, same behavior. All three axes flow through the SAME
+# `NEEDS_VERIFICATION` inventory path as ENUMGAP — the verify-the-positives
+# filter adjudicates every candidate; nothing here is promoted to
+# body-at-severity directly. Unconditional: not Thorough-only, not
+# confidence-gated (the failure mode is a confidently-WRONG agent, not merely
+# a low-confidence one). No-overfit: pure graph/shape mechanics — every
+# regex below is a HOW-shaped structural cue (param-type vocabulary, generic
+# boundary-value vocabulary, pair-table parsing), never a protocol, token, or
+# function name.
+
+_CONFIRMED_VERDICTS = ("confirmed", "partial")
+
+# Per-language TYPE cues for Axis 2. Deliberately independent of `_LANG`'s
+# `array_param`/`str_param`/etc. keys so this addition cannot perturb any
+# existing deriver's behavior. A language absent from this map (or DAML,
+# which has no `_LANG` entry at all) degrades Axis 2 to a no-op for that
+# finding — recall-neutral, never a wrong-positive.
+_PARAM_TYPE_CUES = {
+    "sol": {
+        "numeric": _c(r"\bu?int\d*\b"),
+        "address": _c(r"\baddress\b"),
+        "collection": _c(r"\[\]|\bmapping\s*\("),
+    },
+    "rust": {
+        "numeric": _c(r"\b[iu](?:8|16|32|64|128|size)\b"),
+        "address": _c(r"\bPubkey\b|\bAddress\b|\bAccountId\b"),
+        "collection": _c(r"\bVec\s*<|\[\s*\w[^;\]]*;|\bHashMap\b|\bBTreeMap\b|\bHashSet\b"),
+    },
+    "move": {
+        "numeric": _c(r"\bu(?:8|16|32|64|128|256)\b"),
+        "address": _c(r"\baddress\b"),
+        "collection": _c(r"\bvector\s*<"),
+    },
+    "go": {
+        "numeric": _c(r"\b(?:u?int(?:8|16|32|64)?|float(?:32|64))\b"),
+        "address": _c(r"\bcommon\.Address\b|\bAddress\b"),
+        "collection": _c(r"\[\]\w|\bmap\s*\["),
+    },
+}
+
+# The required-addressed boundary set (generic, HOW-shaped — no protocol
+# constant). One VARGAP candidate per member NOT named anywhere in the
+# finding's own prose.
+_BOUNDARY_MEMBERS = ("0", "1", "min", "MAX", "empty", "self")
+_BOUNDARY_CUES = {
+    "0": _c(r"(?i)\b(?:zero|0)\b"),
+    "1": _c(r"(?i)\b(?:one|1)\b"),
+    "min": _c(r"(?i)\bmin(?:imum)?\b"),
+    "MAX": _c(r"(?i)\bmax(?:imum)?\b"),
+    "empty": _c(r"(?i)\bempty\b"),
+    "self": _c(r"(?i)\bself\b|\bthis\s+contract\b|\bown(?:\s+address)?\b"),
+}
+
+
+def _block_verdict(block_text: str) -> str:
+    """Best-effort `**Verdict**:` extraction from a finding block. Empty
+    (never raises) when the shared field parser is unavailable — degrades
+    every Gate-V axis to a no-op rather than mis-classifying a verdict."""
+    if _field_from_markdown is None:
+        return ""
+    try:
+        return (_field_from_markdown(block_text or "",
+                                     ("Verdict", "Final Verdict", "Status")) or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _is_confirmed_verdict(block_text: str) -> bool:
+    v = _block_verdict(block_text)
+    return any(v.startswith(c) for c in _CONFIRMED_VERDICTS)
+
+
+def compute_boundary_input_candidates(scratchpad: Path) -> list:
+    """Gate V axis 2 (boundary-input coverage). For each CONFIRMED/PARTIAL
+    finding whose enclosing function takes a numeric/collection/address
+    parameter, the required-addressed boundary set is
+    {0, 1, min, MAX, empty, self}. A boundary never named in the finding's
+    own prose is a coverage gap -> one VARGAP candidate per missing boundary.
+    Never raises; a no-op when the graph, inventory, or source-parsed
+    param-type info is absent for the finding's language (recall-neutral)."""
+    try:
+        scratchpad = Path(scratchpad)
+        graph = _load_graph(scratchpad)
+        inv = scratchpad / "findings_inventory.md"
+        if graph is None or _inventory_blocks is None or not inv.exists():
+            return []
+        root = _locate_project_root(scratchpad)
+        if root is None:
+            return []
+        try:
+            blocks = _inventory_blocks(inv.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return []
+        # bare function name (lowercased, first occurrence wins) -> (lang, params)
+        fn_index: dict = {}
+        for lang, _rel_path, name, params, _body, _line in _iter_functions(root):
+            fn_index.setdefault(name.lower(), (lang, params))
+        if not fn_index:
+            return []  # no parseable production functions -> no-op
+
+        out: list = []
+        for b in blocks:
+            if len(out) >= _MAX_PER_DERIVER:
+                break
+            if not _is_confirmed_verdict(b.get("block", "")):
+                continue
+            fid = b.get("id", "")
+            fk = _fn_at_location(graph, b.get("location", ""))
+            if not fk:
+                continue
+            fbare = graph["functions"][fk].get("bare", fk.split(".")[-1])
+            entry = fn_index.get(fbare.lower())
+            if not entry:
+                continue  # graph lacks param-type info for this function -> no-op
+            lang, params = entry
+            cues = _PARAM_TYPE_CUES.get(lang)
+            if not cues or not (params or "").strip():
+                continue  # graph lacks param-type info for this language -> no-op
+            if not any(rx.search(params) for rx in cues.values()):
+                continue  # no qualifying numeric/collection/address param
+            text_l = (b.get("block", "") or "").lower()
+            for member in _BOUNDARY_MEMBERS:
+                if len(out) >= _MAX_PER_DERIVER:
+                    break
+                if _BOUNDARY_CUES[member].search(text_l):
+                    continue
+                out.append({
+                    "key": f"VARGAP-B:{fid}:{fbare}:{member}",
+                    "title": (f"Boundary-input coverage gap: `{fbare}` not verified at "
+                              f"the `{member}` boundary ({fid})"),
+                    "location": f"`{fbare}` (boundary-input sibling of {fid})",
+                    "source_note": ("boundary-input coverage gap; mechanically derived "
+                                    "— verifier to confirm or refute"),
+                    "root_cause": (f"{fid} confirmed a defect in `{fbare}`, which takes a "
+                                   f"numeric/collection/address parameter. The finding's "
+                                   f"own prose does not address the `{member}` boundary "
+                                   "value for that parameter."),
+                    "description": (f"Verify whether `{fbare}` behaves correctly (or "
+                                    f"shares {fid}'s defect) when the relevant parameter "
+                                    f"is at the `{member}` boundary."),
+                    "impact": (f"Potential unaddressed boundary-value variant of {fid}'s "
+                               "defect (verifier to confirm the concrete harm)."),
+                    "postcondition": (f"STATE: `{fbare}` boundary `{member}` not addressed "
+                                      f"by {fid}'s analysis"),
+                    "postcondition_type": "STATE",
+                })
+        return out
+    except Exception:
+        return []
+
+
+# Bounded parser for chain_prep's already-computed pair tables (READ-ONLY
+# reuse; `compute_chain_candidate_pairs` in chain_prep.py is NOT edited by
+# this module). Table shape (see chain_prep.py `_fmt_table`):
+#   | Finding A | A Severity | Finding B | B Severity | Shared Signal |
+_PAIR_ROW_RE = _c(
+    r"^\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*)\|?\s*$"
+)
+
+
+def _parse_chain_candidate_pairs(text: str) -> list:
+    """Parse `chain_candidate_pairs.md`'s STATE/TYPE Pairs tables into
+    `[{a, b, a_sev, b_sev, signal}, ...]`. Skips header/separator/placeholder
+    rows. Never raises; empty on any parse failure."""
+    out: list = []
+    try:
+        for m in _PAIR_ROW_RE.finditer(text or ""):
+            a, a_sev, b, b_sev, sig = (g.strip() for g in m.groups())
+            if not a or a.lower() == "finding a" or set(a) <= {"-"}:
+                continue
+            if a == "(none)" or b == "(none)":
+                continue
+            out.append({"a": a, "b": b, "a_sev": a_sev, "b_sev": b_sev, "signal": sig})
+    except Exception:
+        return []
+    return out
+
+
+def compute_symmetric_operation_candidates(scratchpad: Path) -> list:
+    """Gate V axis 3 (symmetric-operation coverage). Reads the already-
+    computed `chain_candidate_pairs.md` STATE/TYPE pairs as operation-sibling
+    pairs. A CONFIRMED/PARTIAL defect on one leg of a pair whose sibling
+    leg's OWN finding is not itself CONFIRMED/PARTIAL is an unaddressed
+    symmetric-operation gap -> one VARGAP for the unaddressed leg. Never
+    raises; a no-op when the pairs file or inventory is absent, or when a
+    pair's finding IDs are not both resolvable in the inventory."""
+    try:
+        scratchpad = Path(scratchpad)
+        pairs_path = scratchpad / "chain_candidate_pairs.md"
+        inv = scratchpad / "findings_inventory.md"
+        if not pairs_path.exists() or _inventory_blocks is None or not inv.exists():
+            return []
+        try:
+            pairs_text = pairs_path.read_text(encoding="utf-8", errors="replace")
+            inv_text = inv.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return []
+        pairs = _parse_chain_candidate_pairs(pairs_text)
+        if not pairs:
+            return []
+        try:
+            blocks = {bl["id"]: bl for bl in _inventory_blocks(inv_text)}
+        except Exception:
+            return []
+
+        out: list = []
+        seen_pairs: set = set()
+        for p in pairs:
+            if len(out) >= _MAX_PER_DERIVER:
+                break
+            a_id, b_id = p["a"], p["b"]
+            ba, bb = blocks.get(a_id), blocks.get(b_id)
+            if not ba or not bb:
+                continue  # sibling leg not resolvable in the inventory -> no-op
+            a_confirmed = _is_confirmed_verdict(ba.get("block", ""))
+            b_confirmed = _is_confirmed_verdict(bb.get("block", ""))
+            if a_confirmed == b_confirmed:
+                continue  # both addressed, or neither -> nothing mechanically established
+            confirmed_id, gap_id, gap_block = (
+                (a_id, b_id, bb) if a_confirmed else (b_id, a_id, ba)
+            )
+            pairkey = f"{confirmed_id}:{gap_id}"
+            if pairkey in seen_pairs:
+                continue
+            seen_pairs.add(pairkey)
+            gap_loc = gap_block.get("location", "") or gap_id
+            gap_title = gap_block.get("title", "") or gap_id
+            out.append({
+                "key": f"VARGAP-S:{confirmed_id}:{gap_id}",
+                "title": (f"Symmetric-operation coverage gap: {gap_id} ({gap_title}) is "
+                          f"the paired operation of confirmed defect {confirmed_id} and "
+                          "is not itself confirmed/partial"),
+                "location": f"{gap_loc} (symmetric-operation sibling of {confirmed_id})",
+                "source_note": ("symmetric-operation coverage gap; mechanically derived "
+                                "— verifier to confirm or refute"),
+                "root_cause": (f"{confirmed_id} and {gap_id} share a state/type signal "
+                               f"({p.get('signal', '')}) per chain_candidate_pairs.md, "
+                               "identifying them as a structurally symmetric operation "
+                               f"pair. {confirmed_id} is CONFIRMED/PARTIAL but {gap_id} "
+                               "is not, so the paired leg's own defect status is "
+                               "unaddressed."),
+                "description": (f"Verify whether {gap_id} exhibits the same class of "
+                                f"defect confirmed at {confirmed_id} on its symmetric "
+                                "operation leg."),
+                "impact": (f"Potential repeat instance of {confirmed_id}'s defect on the "
+                           "paired operation (verifier to confirm the concrete harm)."),
+                "postcondition": (f"STATE: paired operation leg {gap_id} may share "
+                                  f"{confirmed_id}'s confirmed defect"),
+                "postcondition_type": "STATE",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def compute_variant_gaps(scratchpad: Path) -> dict:
+    """Gate V driver entry (Fix A — 3-axis Variant-Family Coverage). Axis 1
+    (co-reference) reuses the existing G1/G2 gate UNCHANGED
+    (`compute_enumeration_obligations` / `validate_enumeration_coverage`);
+    axes 2 (boundary-input) and 3 (symmetric-operation) are the new derivers
+    above. All three emit through the SAME append-only, idempotent, bounded,
+    low-confidence inventory path (`_emit_candidates`, shared receipt).
+    Unconditional (not Thorough-only, not confidence-gated).
+
+    This function is intentionally NOT wired into `run_enumeration_gate`'s
+    existing call sites — it is a separate, additive entry point the driver
+    calls alongside it (mirroring the G1/G2 naming convention so the driver
+    owner can wire the new call site without touching this module further).
+    Never raises."""
+    scratchpad = Path(scratchpad)
+    result = {"axis1_emitted": 0, "axis2_emitted": 0, "axis3_emitted": 0,
+              "obligations": 0, "gaps": 0, "emitted": 0}
+    try:
+        result["obligations"] = compute_enumeration_obligations(scratchpad)
+        axis1_res = validate_enumeration_coverage(scratchpad)
+        result["gaps"] = axis1_res.get("gaps", 0)
+        result["axis1_emitted"] = int(axis1_res.get("emitted", 0))
+    except Exception:
+        pass
+    try:
+        b_cands = compute_boundary_input_candidates(scratchpad)
+        result["axis2_emitted"] = _emit_candidates(scratchpad, b_cands, _MAX_PER_DERIVER,
+                                                   source_id="VARGAP")
+    except Exception:
+        pass
+    try:
+        s_cands = compute_symmetric_operation_candidates(scratchpad)
+        result["axis3_emitted"] = _emit_candidates(scratchpad, s_cands, _MAX_PER_DERIVER,
+                                                   source_id="VARGAP")
+    except Exception:
+        pass
+    result["emitted"] = (result["axis1_emitted"] + result["axis2_emitted"]
+                         + result["axis3_emitted"])
+    return result
+
+
+def validate_variant_coverage(scratchpad: Path) -> dict:
+    """Alias for `compute_variant_gaps`, named to mirror the existing G2
+    (`validate_enumeration_coverage`) convention for driver call-site parity.
+    Never raises."""
+    return compute_variant_gaps(Path(scratchpad))
 
 
 # ── MECHANISM 1 — committed-invariant assertion deriver ──────────────────────

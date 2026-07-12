@@ -368,8 +368,19 @@ Grep for these patterns (exclude lib/, test/, mocks/):
 | `IUniswapV2Router\|IUniswapV3Pool\|IUniswapV4Pool\|IBalancerVault\|IWeightedPool\|IAToken\|ILendingPool\|IPool\(aave\)\|ICToken\|IComptroller\|ICurvePool\|IStableSwap\|IChainlinkAggregator\|AggregatorV3Interface\|IStETH\|IWstETH` (EXCLUDE: @openzeppelin generic utilities, solmate, solady " only flag when calling protocol-specific functions) | NAMED_EXTERNAL_PROTOCOL |
 | `.call{value\|.call(\|.delegatecall(` targeting non-hardcoded address after state change | OUTCOME_CALLBACK_LOW_LEVEL |
 | `deadline\|claimPeriod\|default.*selection\|fallback.*assign\|getDefault\|expir` AND time-gated with fallback path | OUTCOME_DELAY |
+| ANY imported `interface`/abstract contract whose implementation is NOT vendored in-repo (only an ABI/address is known — not a local `.sol` with a real function body), is NOT a recognized stdlib/@openzeppelin/solmate/solady-class utility, AND whose return value or side effect is consumed by the calling code (assigned to a variable, branched on, or used to move funds/state) | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
 
 Write detected flags to {SCRATCHPAD}/detected_patterns.md
+
+**`EXTERNAL_DEPENDENCY` is a GENERIC, non-brand mechanical trigger** — it exists
+because the row above it (`NAMED_EXTERNAL_PROTOCOL`) only fires for ~15 famous
+interface names and misses every custom/unfamous bridge, messenger, or pool.
+The test is structural, never a name: (a) no in-repo implementation body, (b)
+not a stdlib/OZ/solmate/solady utility, (c) return value or side effect is
+consumed. A codebase can trip `EXTERNAL_DEPENDENCY` without matching a single
+brand regex above — that is the intended widening, not a bug. Every dependency
+that sets EXTERNAL_DEPENDENCY or NAMED_EXTERNAL_PROTOCOL gets a row in the
+External Dependency Research Ledger in TASK 11 below.
 
 **`NON_EVM_TARGET` is a MECHANICAL trigger — do NOT downgrade it on judgment.**
 Set `NON_EVM_TARGET = YES` whenever BOTH hold: (a) the codebase builds bytes via
@@ -490,7 +501,7 @@ After listing all recommended templates, output this binding manifest:
 | EXTERNAL_PRECONDITION_AUDIT | External interactions detected | {YES/NO} | {if YES: external contract count} |
 | STORAGE_LAYOUT_SAFETY | STORAGE_LAYOUT flag | {YES/NO} | {if YES: proxy/delegatecall/assembly patterns found} |
 | CROSS_CHAIN_MESSAGE_INTEGRITY | CROSS_CHAIN_MSG flag | {YES/NO} | {if YES: lzReceive/ccipReceive/setPeer patterns found} |
-| INTEGRATION_HAZARD_RESEARCH | NAMED_EXTERNAL_PROTOCOL flag | {YES/NO} | {if YES: list detected protocols " e.g., "Uniswap V3, Chainlink"} |
+| INTEGRATION_HAZARD_RESEARCH | NAMED_EXTERNAL_PROTOCOL flag (includes generic EXTERNAL_DEPENDENCY hits, which alias it) | {YES/NO} | {if YES: list detected dependencies, named or generic " e.g., "Uniswap V3, Chainlink, custom bridge messenger"} |
 
 ### Binding Rules
 - SEMI_TRUSTED_ROLE flag detected â†’ SEMI_TRUSTED_ROLES **REQUIRED**
@@ -575,6 +586,47 @@ Write to {SCRATCHPAD}/external_production_behavior.md
 - Analysis agents MUST NOT use mock behavior as evidence to REFUTE findings
 - Verifiers MUST return CONTESTED (not REFUTED) for external dep related hypotheses
 - **Severity floor**: UNVERIFIED external deps with HIGH worst-case â†’ minimum MEDIUM
+
+### External Dependency Research Ledger (MANDATORY)
+
+You are the ONLY phase with both live WebSearch/WebFetch/tavily_search AND full
+attack-surface knowledge of every external call site. depth-phase workers run
+with `--disallowedTools mcp__*` and no live web tools — they can only READ the
+ledger you bake here, they cannot re-research it themselves. Do the research
+now, not later.
+
+For EVERY dependency flagged `NAMED_EXTERNAL_PROTOCOL` or `EXTERNAL_DEPENDENCY`
+in TASK 6 (named or generic), write one row to
+`{SCRATCHPAD}/external_dependency_research.md`:
+
+| Dependency | Integration Surface | Assumed Behavior | Real Behavior | Source | Conformance | Fetch Status |
+|------------|----------------------|-------------------|-----------------|--------|-------------|---------------|
+
+- **Dependency**: interface/contract name (or a short descriptive label for a
+  generic/unnamed dependency, e.g. `custom bridge messenger`).
+- **Integration Surface**: ALL call sites, `file:line`, comma-separated.
+- **Assumed Behavior**: what the calling code assumes, as coded (infer from
+  how the return value/side effect is consumed).
+- **Real Behavior**: the researched real semantics (via WebSearch/WebFetch/
+  tavily_search — official docs, verified deployed source, audit reports). If
+  a deployed address is known, prefer fetching verified source (block
+  explorer) over prose docs.
+- **Source**: URL + fetch date (`fetched {DATE}`), or `verified deployed
+  source: {address}`.
+- **Conformance**: `MATCH` (assumed == real) / `MISMATCH` (assumed != real —
+  flag for depth) / `CHECK` (could not fully determine, needs depth
+  follow-up).
+- **Fetch Status**: `OK`, or `FETCH_FAILED:{reason}` if the web lookup failed
+  or timed out.
+
+**Never drop a row.** If research fails for a dependency, still write the row
+with `Fetch Status: FETCH_FAILED:{reason}` and `Conformance: CHECK` — a
+carried-forward unresolved obligation, not a silent omission.
+
+Write to `{SCRATCHPAD}/external_dependency_research.md`. If NO dependencies
+were flagged in TASK 6, still write the file with only the header row (empty
+ledger is a valid terminal state — the downstream gate treats it as "nothing
+to check", not "recon didn't run").
 
 ---
 

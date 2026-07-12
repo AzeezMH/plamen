@@ -45,37 +45,51 @@ For each section below, execute in order:
 
 For EACH named external protocol detected by recon:
 
-### 0a. Solodit Search (two queries per protocol, parallel)
+### 0a. Read the Recon-Baked External Dependency Research Ledger (PRIMARY — MANDATORY)
+
+DO NOT call `mcp__unified-vuln-db__search_solodit_live` or any tavily/web-search
+MCP tool for dependency research. They are unavailable in depth-phase subagent
+contexts — the driver launches `depth` workers with `--disallowedTools mcp__*`
+and an empty MCP server config to prevent cold-start hangs. Any Solodit/Tavily
+MCP call in this phase will silently fail or hang; do not attempt it.
+
+Read `{SCRATCHPAD}/external_dependency_research.md` instead. This is the
+recon-baked research ledger: recon runs as a phase-LLM with live
+`WebSearch`/`WebFetch`/`tavily_search` access and already researched every
+detected external dependency's real interface/semantics (deployed source,
+ABI/arity, monotonicity, gas/error behavior) before depth ever runs. For each
+target protocol/dependency, find its row: `Dependency | Integration Surface
+(file:line) | Assumed Behavior (as coded) | Real Behavior (researched) |
+Source (URL + fetch date) | Conformance MATCH/MISMATCH/CHECK | Fetch Status
+OK/FETCH_FAILED:reason`. Use the ledger's Real Behavior / Conformance columns
+as your hazard-catalog input for Section 0c below instead of live search
+results.
+
+### 0b. Escalate Uncovered Surfaces — Do Not Guess (MANDATORY)
+
+For an integration surface in your target that is NOT covered by any ledger
+row (a dependency the ledger missed, or a row with `Fetch Status:
+FETCH_FAILED`), do NOT guess the real behavior and do NOT silently fall
+through to the 0d floor catalog as if it were live research. Emit, in your
+finding output, one escalation line per uncovered surface:
 
 ```
-// Query 1: Known integration issues
-search_solodit_live(
-  keywords="{protocol_name} integration vulnerability",
-  impact=["HIGH", "CRITICAL"],
-  quality_score=3,
-  sort_by="Quality",
-  max_results=10
-)
-// Query 2: Known footguns and edge cases
-search_solodit_live(
-  keywords="{protocol_name} caller assumption edge case",
-  impact=["HIGH", "MEDIUM"],
-  sort_by="Rarity",
-  max_results=10
-)
+NEEDS_DEPENDENCY_RESEARCH: <dependency>:<file:line>: <what you need to know>
 ```
 
-### 0b. Tavily Search
-
-```
-tavily_search(query="{protocol_name} smart contract integration pitfalls known issues audit 2024 2025 2026")
-```
+Then proceed under the assumed WORST-CASE realistic external condition per
+Rule 10 (`rules/finding-output-format.md`), tagging the finding
+`[EXTERNAL-ASSUMPTION: <assumed condition>]`. Note: native `WebSearch`/
+`WebFetch` (non-MCP Claude Code tools) remain available if you need a single
+targeted check beyond the ledger — but the ledger is the primary source and
+should cover the large majority of surfaces; ad-hoc web search is not a
+substitute for reading it first.
 
 ### 0c. Compile Hazard Catalog
 
 | Target Protocol | Known Integration Hazard | Severity | Root Cause | Source | Applicable to This Integration? |
 |----------------|------------------------|----------|------------|--------|-------------------------------|
-| {protocol} | {hazard title} | {sev} | {brief root cause} | {Solodit ID / URL} | YES / NO / CHECK |
+| {protocol} | {hazard title} | {sev} | {brief root cause} | {ledger row dependency name / URL from external_dependency_research.md} | YES / NO / CHECK |
 
 **Applicability criteria** (same as FORK_ANCESTRY):
 - YES: The audited code calls the function or reads the state involved in this hazard
@@ -90,46 +104,39 @@ Cross-chain gateways frequently deliver the gas token in a DIFFERENT FORM than t
 3. **RED FLAG → emit a CHECK candidate** (never a silent `UNVERIFIED`): the callback names a wrapped-token address as the asset param but the handler moves it via ERC20 `approve`/`transfer` with NO `deposit{value:}`/`withdraw()` reconciliation (or vice-versa). The missing inbound native→wrapped (or wrapped→native) conversion is a candidate asset-form mismatch — verify reachability and impact.
 4. If the delivery form cannot be confirmed from docs/source, escalate to a CHECK candidate for depth tracing — do NOT drop it as `UNVERIFIED`.
 
-### 0d. Hardcoded Hazard Floor (Fallback if RAG/Web Search Fails)
+### 0d. Hardcoded Hazard Floor (TERTIARY FALLBACK — ledger-miss only, NOT the default)
 
-If Solodit AND Tavily BOTH fail, check EACH applicable protocol against this minimum catalog:
+This floor is a coarse last resort, not a substitute for 0a. Use it ONLY when
+BOTH hold: (1) `external_dependency_research.md` has no row for the
+dependency (or the row is `Fetch Status: FETCH_FAILED`), AND (2) you have
+already emitted the matching `NEEDS_DEPENDENCY_RESEARCH` escalation line for
+it per 0b. Do NOT reach for this table as a first move, and do NOT treat a
+hit here as equivalent to a live-researched ledger row — it only lists
+historical bug *classes* for a fixed list of famous protocols, not the
+dependency's current real interface/semantics. Check EACH applicable
+protocol against this minimum catalog:
 
-| Target Protocol | Critical Integration Hazard | Root Cause | Check For |
-|----------------|---------------------------|------------|-----------|
-| Uniswap V2/V3 | Slippage bypass via `amountOutMin=0` | Caller passes zero slippage tolerance | Zero slippage in any swap call |
-| Uniswap V3 | Stale pool observation | `observe()` returns stale TWAP if pool is inactive | TWAP reads without freshness check |
-| Uniswap V4 | Hook reentrancy into caller | V4 hooks execute arbitrary code during swap | State changes before/after V4 swap call |
-| Aave V2/V3 | Flash loan + oracle manipulation | Flash-borrowed tokens shift oracle price within same tx | Oracle reads after Aave interaction |
-| Aave V3 | E-mode collateral factor assumption | E-mode factors change by governance | Hardcoded LTV assumptions |
-| Compound V2 | Exchange rate manipulation on empty market | First-depositor rounding exploit on cToken | cToken interaction with low totalSupply |
-| Compound V3 (Comet) | Absorb front-running | Liquidation absorb is permissionless and competitive | Liquidation timing assumptions |
-| Balancer V2 | Read-only reentrancy via pool balances | View functions read stale state during callback | Balance queries during or after Balancer interaction |
-| Curve | Raw ETH reentrancy in remove_liquidity | ETH transfer callback before state update | State reads after Curve ETH pool interaction |
-| Chainlink | Stale price from sequencer downtime | L2 sequencer outage returns last known price | Price consumption without sequencer uptime check |
-| Chainlink | Deprecated aggregator migration | Price feed address changes after aggregator migration | Hardcoded feed addresses |
-| Lido | stETH rebasing balance changes | balanceOf changes between blocks without transfers | stETH balance used as accounting input |
-| Lido | wstETH/stETH exchange rate assumption | Rate changes with each rebase | Hardcoded or cached conversion rate |
-| MakerDAO | DAI Savings Rate (DSR) flash manipulation | `pot.drip()` is permissionless and changes chi | State reads dependent on DSR rate |
-| **Solana** | | | |
-| Jupiter | Slippage bypass via `0` slippage on `route()` / `shared_accounts_route()` | Caller passes zero min-out | Zero slippage tolerance in CPI args |
-| Jupiter | Stale quote across slots | Quote computed in slot N, executed in slot N+K with changed pool state | Cross-slot quote freshness |
-| Marinade | Delayed unstake ticket manipulation | `OrderUnstake` creates tickets claimable after epoch boundary | Ticket state reads after epoch change |
-| Marinade | mSOL/SOL exchange rate assumption | Rate changes with each epoch stake reward distribution | Cached or hardcoded mSOL conversion rate |
-| Raydium | Concentrated liquidity tick manipulation | Price manipulation within tick range via large swaps | Oracle/price reads from Raydium pool state |
-| Orca (Whirlpool) | Position NFT metadata assumption | Whirlpool positions are NFTs; burning/transferring changes liquidity state | Reads of position data without ownership check |
-| Pyth | Stale price from publisher downtime | `price.publish_time` can be arbitrarily old | Price consumption without `max_staleness` check |
-| Pyth | Confidence interval ignored | Price has wide confidence interval during volatility | Using `price.price` without checking `price.conf` |
-| **Sui** | | | |
-| Cetus | Concentrated liquidity tick crossing DoS | Extreme tick density causes gas exhaustion on swap | Swap calls into Cetus pools with narrow tick spacing |
-| DeepBook | Order cancellation race | Permissionless cancel on expired orders | Reading order state that a third party can cancel |
-| Pyth (Sui) | Stale price via `PriceInfoObject` | Price update transaction may not be in same PTB | Price reads without freshness assertion |
-| **Aptos** | | | |
-| Thala | ThalaSwap stable pool invariant at low liquidity | Amplification factor causes extreme slippage at pool edges | Swap calls into Thala stable pools near depletion |
-| Liquidswap | Unchecked curve type | Stable vs uncorrelated curve selection affects pricing | Hardcoded curve type assumption |
-| Pyth (Aptos) | Stale price from `pyth::get_price()` | Price staleness not enforced by default | Price reads without `get_price_no_older_than()` |
-| Wrapped-native gas-token gateway | Gas/native token delivered in a different FORM than the handler's first value-moving op assumes | Gateway may auto-(un)wrap; handler assumes the other form and skips the conversion | Any gateway that may auto-(un)wrap: verify the inbound native↔wrapped conversion is present and the first value-moving op's form (native send vs ERC20 transfer) matches the delivered form |
+This floor is keyed on the dependency's **TYPE** (generic mechanism), NOT on any
+specific protocol name — brand-keyed rows are prohibited (a floor row naming a
+specific protocol is the confirmed benchmark-contamination vector; see the HARD
+no-overfit rule). Classify the detected dependency into a type below and check
+the generic hazard class; use at most one illustrative brand only in prose, never
+as the row key.
 
-**Note**: This floor catalog covers only the most critical hazards. RAG/web results typically surface 3-5x more per protocol. Treat the floor as minimum coverage, not exhaustive.
+| Dependency Type | Generic Integration Hazard (class) | Check For |
+|-----------------|-----------------------------------|-----------|
+| AMM / swap pool | Slippage bypass when min-out may be 0; stale TWAP/observation read from an inactive pool; read-only reentrancy via pool-balance views during a callback | any swap call with zero/unbounded slippage; a price/observation read with no freshness assertion; a balance query during or after the external interaction |
+| Lending / money market | First-depositor / empty-market exchange-rate rounding; flash-borrow-driven oracle shift within one tx; governance-mutable collateral factor assumed constant | receipt-token interaction at low total supply; an oracle read after interacting with the dependency; a hardcoded LTV / collateral factor |
+| Oracle / price feed | Stale price (publisher or L2-sequencer downtime) consumed without a max-staleness check; confidence / exponent field ignored; feed or aggregator address assumed permanent | a price read with no freshness/staleness bound; use of the price without checking its confidence/exponent; a hardcoded feed address |
+| Bridge / cross-chain messenger | Delivered value in a different FORM than the handler assumes (native vs wrapped auto-(un)wrap); message/return arity or ABI differing from the vendored interface; zero- or underfunded-gas send that "succeeds" without delivery | the inbound native↔wrapped conversion is present and the first value-moving op's form matches the delivered form; the real deployed message signature vs the vendored trait; the messenger's zero-gas success semantics |
+| Staking / rebasing token | Balance changing between blocks with no transfer (rebase) used as an accounting input; share↔underlying conversion rate assumed constant | a `balanceOf` used as accounting that can rebase; a hardcoded or cached conversion rate |
+| Delayed-claim / epoch ticket | State claimable only after an epoch/time boundary read as if immediately available | ticket/order state reads across an epoch or time boundary |
+| Concentrated-liquidity / order-book DEX | Tick-density gas-exhaustion DoS on swap; permissionless cancellation of an order a third party can race | swap calls into narrow-tick pools; reading order/position state a third party can cancel or mutate |
+
+**Note**: This floor lists generic hazard CLASSES by dependency type only — it is
+minimum coverage, not exhaustive, and NOT a substitute for the live-researched
+ledger (0a). Real research typically surfaces several more hazards specific to the
+actual dependency.
 
 ### 0e. Record Research Results
 
@@ -187,10 +194,10 @@ Tag: `[VARIATION:external_state({value}) fresh_at_read=X → stale_at_use=Y → 
 
 | Section | Required | Completed? | Notes |
 |---------|----------|------------|-------|
-| 0a. Solodit search per target protocol | YES | Y/N/? | |
-| 0b. Tavily search per target protocol | YES (fallback: 0d floor catalog) | Y/N/? | |
+| 0a. Ledger read (`external_dependency_research.md`) per target dependency | YES — no MCP calls | Y/N/? | |
+| 0b. `NEEDS_DEPENDENCY_RESEARCH` emitted for every ledger-uncovered surface | YES for each uncovered surface | Y/N/? | |
 | 0c. Hazard catalog compiled | YES | Y/N/? | |
-| 0d. Floor catalog checked (if RAG failed) | IF 0a+0b failed | Y/N/? | |
+| 0d. Floor catalog checked (TERTIARY — ledger-miss AND 0b escalation only) | IF 0a had no row AND 0b escalated | Y/N/? | |
 | 0e. integration_hazard_catalog.md written | YES | Y/N/? | |
 | 1. Third-party race conditions | FOR EACH YES/CHECK hazard | Y/N/? | |
 | 2. Integration state TOCTOU | FOR EACH external state read | Y/N/? | |

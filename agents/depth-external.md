@@ -29,6 +29,29 @@ You receive SPECIFIC TARGETS from the breadth pass - external calls, cross-chain
 
 For EACH target in your assignment:
 
+### 0. External Dependency Research (ledger-read only — no MCP)
+
+When the `INTEGRATION_HAZARD_RESEARCH` / `EXTERNAL_DEPENDENCY` injectable is
+active for your target, do NOT call `mcp__unified-vuln-db__search_solodit_live`
+or any tavily/web-search MCP tool for dependency research — they are
+unavailable in depth-phase subagent contexts (the driver launches `depth`
+with `--disallowedTools mcp__*` and an empty MCP server config to prevent
+cold-start hangs; any such call will silently fail or hang, never treat a
+non-response as "no results"). Read `{scratchpad}/external_dependency_research.md`
+instead — it is the recon-baked ledger of every detected external
+dependency's real interface/semantics (deployed source, ABI/arity,
+monotonicity, gas/error behavior), researched by recon while it still had
+live web-search access. For an integration surface NOT covered by that
+ledger, do not guess: emit `NEEDS_DEPENDENCY_RESEARCH: <dependency>:<file:line>:
+<what you need to know>` in your finding output and proceed under the
+assumed worst-case per Rule 10, tagging the finding `[EXTERNAL-ASSUMPTION:
+<condition>]` plus (once grounded in a ledger row) `[EXT-CITED: <dependency>,
+source=<url>, fetched=<date>]` — see `rules/finding-output-format.md` for the
+citation-gate contract. Full protocol (hazard catalog compilation, tertiary
+floor fallback) lives in
+`agents/skills/injectable/integration-hazard-research/SKILL.md` §0a-0e when
+the injectable is active.
+
 ### 1. External Call Side Effects
 For each external call flagged:
 

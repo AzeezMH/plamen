@@ -437,8 +437,18 @@ Grep for these patterns (exclude lib/, test/, mocks/):
 | `.call{value\|.call(\|.delegatecall(` targeting non-hardcoded address after state change | OUTCOME_CALLBACK_LOW_LEVEL |
 | `deadline\|claimPeriod\|default.*selection\|fallback.*assign\|getDefault\|expir` AND time-gated with fallback path | OUTCOME_DELAY |
 | `encodeAccount\|decompressAccount\|compressAccount\|isWritable\|isSigner\|base58\|bech32\|[Bb]orsh\|toBytes32\|fromBytes32\|abi.encodePacked.*\(targetChain\|destChain\|destinationChain\|chainId\)` (EVM contract SERIALIZING a payload for a NON-EVM VM — Solana/Bitcoin/Move/Cosmos: account-byte / pubkey-width (20↔32) / Borsh / base58 / bech32 encoders, or outbound cross-chain message bytes destined for a foreign VM) | NON_EVM_TARGET |
+| ANY imported `interface`/abstract contract whose implementation is NOT vendored in-repo (only an ABI/address is known — not a local `.sol` with a real function body), is NOT a recognized stdlib/@openzeppelin/solmate/solady-class utility, AND whose return value or side effect is consumed by the calling code (assigned to a variable, branched on, or used to move funds/state) | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
 
 Write detected flags to {SCRATCHPAD}/detected_patterns.md
+
+**`EXTERNAL_DEPENDENCY` is a GENERIC, non-brand mechanical trigger** — it exists
+because `NAMED_EXTERNAL_PROTOCOL` only fires for ~15 famous interface names
+and misses every custom/unfamous bridge, messenger, or pool. The test is
+structural, never a name: (a) no in-repo implementation body, (b) not a
+stdlib/OZ/solmate/solady utility, (c) return value or side effect is
+consumed. Every dependency that sets EXTERNAL_DEPENDENCY or
+NAMED_EXTERNAL_PROTOCOL gets a row in the External Dependency Research Ledger
+in TASK 11 below.
 
 ## TASK 7: Prep Artifacts
 From function_list.md, extract:
@@ -628,6 +638,39 @@ Write to {SCRATCHPAD}/external_production_behavior.md
 - Analysis agents MUST NOT use mock behavior as evidence to REFUTE findings
 - Verifiers MUST return CONTESTED (not REFUTED) for external dep related hypotheses
 - **Severity floor**: UNVERIFIED external deps with HIGH worst-case → minimum MEDIUM
+
+### External Dependency Research Ledger (MANDATORY)
+
+You are the ONLY phase with both live web tools (WebSearch/WebFetch/
+farofino/tavily) AND full attack-surface knowledge of every external call
+site. depth-phase workers run with `--disallowedTools mcp__*` and no live
+web tools — they can only READ the ledger you bake here. Do the research
+now, not later.
+
+For EVERY dependency flagged `NAMED_EXTERNAL_PROTOCOL` or `EXTERNAL_DEPENDENCY`
+in TASK 6 (named or generic), write one row to
+`{SCRATCHPAD}/external_dependency_research.md`:
+
+| Dependency | Integration Surface | Assumed Behavior | Real Behavior | Source | Conformance | Fetch Status |
+|------------|----------------------|-------------------|-----------------|--------|-------------|---------------|
+
+- **Dependency**: interface/contract name (or a short descriptive label for a
+  generic/unnamed dependency).
+- **Integration Surface**: ALL call sites, `file:line`, comma-separated.
+- **Assumed Behavior**: what the calling code assumes, as coded.
+- **Real Behavior**: researched real semantics (WebSearch/WebFetch/tavily —
+  official docs, verified deployed source, audit reports).
+- **Source**: URL + fetch date (`fetched {DATE}`), or `verified deployed
+  source: {address}`.
+- **Conformance**: `MATCH` / `MISMATCH` (flag for depth) / `CHECK`.
+- **Fetch Status**: `OK`, or `FETCH_FAILED:{reason}`.
+
+**Never drop a row.** A failed lookup still gets a row with `Fetch Status:
+FETCH_FAILED:{reason}` and `Conformance: CHECK` — carried forward, never
+silently omitted.
+
+Write to `{SCRATCHPAD}/external_dependency_research.md`. If NO dependencies
+were flagged in TASK 6, still write the file with only the header row.
 
 ---
 

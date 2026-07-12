@@ -3979,6 +3979,428 @@ def _write_report_index_seed_shards(
     return counts
 
 
+def _run_gate_v_for_phase(phase_name: str, scratchpad: Path) -> dict:
+    """Gate V (Fix A, recall) driver entry: 3-axis Variant-Family Coverage.
+
+    Axis 1 (co-reference) is the existing G1/G2 gate (`run_enumeration_gate`,
+    called separately, immediately before this) — UNCHANGED. Axes 2
+    (boundary-input) and 3 (symmetric-operation), reached via
+    `enumeration_gate.compute_variant_gaps`, are additive derivers over the
+    same `_mechanical_graph.json` + `chain_candidate_pairs.md` data, emitted
+    through the SAME append-only, idempotent inventory path. Unconditional
+    (not Thorough-only, not confidence-gated) — a confidently-wrong agent is
+    exactly the failure mode this closes.
+
+    Never raises; a no-op (returns `{"emitted": 0}`) when the graph or the
+    chain-candidate-pairs file is absent, mirroring `enumeration_gate`'s own
+    no-op contract. Wired into `_run_phase_validators`'s L1 and SC
+    depth-phase post-processing branches, immediately after
+    `run_enumeration_gate`.
+    """
+    try:
+        import enumeration_gate as _eg
+        res = _eg.compute_variant_gaps(scratchpad)
+    except Exception as exc:
+        log.warning(
+            f"[{phase_name}] variant gate skipped (non-blocking): {exc}"
+        )
+        return {"emitted": 0}
+    if res.get("emitted"):
+        log.info(
+            f"[{phase_name}] variant gate: emitted {res['emitted']} "
+            f"VARGAP candidate(s) (axis2/boundary="
+            f"{res.get('axis2_emitted', 0)}, axis3/symmetric="
+            f"{res.get('axis3_emitted', 0)}) for verification"
+        )
+    return res
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Gate P (Fix C, recall): coverage-seed backfill for promotion-gate output.
+#
+# `route_promotion_orphans` (plamen_mechanical.py) appends BODY-disposed
+# orphans to `findings_inventory.md` as fresh `INV-NNN` NEEDS_VERIFICATION
+# candidates AFTER `report_index_coverage_seed.md` has already been written
+# (Gate P reconciles against the seed, so it must run after the seed exists —
+# see `compute_promotion_orphans`'s no-op-when-seed-absent contract). Left
+# alone, those new IDs would be invisible to the Index Agent's STEP 5
+# completeness check, which is told to enumerate from the bounded seed/shards
+# rather than bulk-reading `findings_inventory.md`.
+#
+# This helper closes that gap the same way the rest of the coverage-seed
+# machinery does: a pure ADDITIVE, idempotent superset append — never
+# rewrites or removes an existing row, never touches severity/verdict of any
+# other finding. It is a convenience backfill only: even if it fails or is
+# skipped, the PROMOGAP findings still physically exist in
+# `findings_inventory.md` and are not lost (recall-safe by construction).
+# ─────────────────────────────────────────────────────────────────────────
+
+_PROMOGAP_SECTION_RE = re.compile(
+    r"##\s*Promotion-Completeness Candidates \(PROMOGAP\)(.*?)(?=\n##\s|\Z)",
+    re.DOTALL,
+)
+_PROMOGAP_BLOCK_RE = re.compile(
+    r"###\s*Finding\s*\[(INV-\d+)\][^\n]*\n"
+    r"\*\*Severity\*\*:\s*([^\n]*)\n"
+    r".*?\*\*Verdict\*\*:\s*([^\n]*)",
+    re.DOTALL,
+)
+
+
+def _append_promogap_ids_to_coverage_seed(scratchpad: Path) -> int:
+    """Additively backfill newly-emitted PROMOGAP IDs into the coverage seed.
+
+    Scans the `## Promotion-Completeness Candidates (PROMOGAP)` section of
+    `findings_inventory.md` (bounded — only that section, never the full
+    100K+ file) for `### Finding [INV-NNN]:` blocks, and appends one seed row
+    per ID not already present in `report_index_coverage_seed.md` (both the
+    flat file and its matching tier shard). Idempotent: a second call with no
+    new PROMOGAP IDs appends nothing. Never raises; any failure degrades to
+    "no backfill" — the findings remain in `findings_inventory.md` regardless.
+    Returns the number of IDs newly added to the seed.
+    """
+    scratchpad = Path(scratchpad)
+    inv_path = scratchpad / "findings_inventory.md"
+    seed_path = scratchpad / "report_index_coverage_seed.md"
+    if not inv_path.exists() or not seed_path.exists():
+        return 0
+    try:
+        inv_text = inv_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    sect_m = _PROMOGAP_SECTION_RE.search(inv_text)
+    if not sect_m:
+        return 0
+    section = sect_m.group(1)
+
+    try:
+        seed_text = seed_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    existing_ids = {m.group(0).upper() for m in re.finditer(r"\bINV-\d+\b", seed_text)}
+
+    new_rows: list[tuple[str, str, str]] = []  # (id, severity, tier)
+    for m in _PROMOGAP_BLOCK_RE.finditer(section):
+        fid = m.group(1).strip().upper()
+        if fid in existing_ids:
+            continue
+        existing_ids.add(fid)
+        sev = m.group(2).strip() or "Medium"
+        tier = _report_index_tier_for_severity(sev)
+        new_rows.append((fid, sev, tier))
+
+    if not new_rows:
+        return 0
+
+    try:
+        seed_lines = seed_text.rstrip("\n").split("\n")
+        # Drop a lone "no bounded IDs found" placeholder row before appending
+        # real rows so the seed table stays well-formed.
+        seed_lines = [
+            ln for ln in seed_lines
+            if "no bounded IDs found" not in ln
+        ]
+        for fid, sev, _tier in new_rows:
+            seed_lines.append(f"| {fid} | {sev} | NEEDS_VERIFICATION | | |")
+        seed_path.write_text("\n".join(seed_lines) + "\n", encoding="utf-8")
+    except Exception:
+        return 0
+
+    # Best-effort: also backfill the matching tier-shard file so the Index
+    # Agent's per-tier-batch pass sees the row too. A failure here only loses
+    # the tier-shard convenience copy; the flat seed above is the primary
+    # completeness source and already carries the row.
+    by_tier: dict[str, list[tuple[str, str]]] = {}
+    for fid, sev, tier in new_rows:
+        by_tier.setdefault(tier, []).append((fid, sev))
+    for tier, rows in by_tier.items():
+        shard_path = scratchpad / f"report_index_seed_{tier}.md"
+        if not shard_path.exists():
+            continue
+        try:
+            shard_text = shard_path.read_text(encoding="utf-8", errors="replace")
+            shard_lines = shard_text.rstrip("\n").split("\n")
+            shard_lines = [
+                ln for ln in shard_lines if "no IDs in this tier" not in ln
+            ]
+            for fid, sev in rows:
+                shard_lines.append(f"| {fid} | {sev} | NEEDS_VERIFICATION | | |")
+            shard_path.write_text("\n".join(shard_lines) + "\n", encoding="utf-8")
+        except Exception:
+            continue
+
+    return len(new_rows)
+
+
+def _run_gate_p_for_report_index(scratchpad: Path) -> dict:
+    """Gate P (Fix C, recall) driver entry: content-shaped Promotion
+    Completeness (Class C pipeline-loss).
+
+    Calls `compute_promotion_orphans` + `route_promotion_orphans`
+    (plamen_mechanical.py) and, when any orphan was routed to the report
+    BODY, additively backfills its ID into `report_index_coverage_seed.md`
+    so the Index Agent's completeness check still finds it. Never raises —
+    any failure logs a warning and returns the zeroed result shape (mirrors
+    `route_promotion_orphans`'s own graph/ledger-absent no-op contract).
+
+    Wired into `main()`'s shared `report_index` pre-hook, immediately after
+    `_write_report_index_coverage_seed` (Gate P reconciles against that
+    seed, so it must run after the seed exists) and before the LLM Index
+    Agent spawns — i.e. "before report" per the design.
+    """
+    scratchpad = Path(scratchpad)
+    zero_result = {
+        "harvested": 0, "body_candidates": 0, "appendix_c": 0,
+        "appendix_a": 0, "emitted_to_inventory": 0,
+    }
+    try:
+        orphans = compute_promotion_orphans(scratchpad)
+        result = route_promotion_orphans(scratchpad, orphans)
+    except Exception as exc:
+        log.warning(
+            f"[report_index] promotion gate skipped (non-blocking): {exc}"
+        )
+        return zero_result
+    if result.get("harvested"):
+        log.info(
+            f"[report_index] promotion gate: harvested "
+            f"{result['harvested']} orphan(s) -> "
+            f"{result.get('emitted_to_inventory', 0)} to body "
+            f"(NEEDS_VERIFICATION), {result.get('appendix_c', 0)} "
+            f"to Appendix C, {result.get('appendix_a', 0)} to "
+            "Appendix A (see promotion_orphans.md / promotion_routing.md)"
+        )
+    if result.get("emitted_to_inventory"):
+        try:
+            backfilled = _append_promogap_ids_to_coverage_seed(scratchpad)
+            if backfilled:
+                log.info(
+                    f"[report_index] backfilled {backfilled} PROMOGAP "
+                    "ID(s) into report_index_coverage_seed.md"
+                )
+        except Exception as exc:
+            log.warning(
+                "[report_index] PROMOGAP coverage-seed backfill failed "
+                f"(non-blocking): {exc!r}"
+            )
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Hook-4 (Fix B, recall): haltless WARN gate for uncited external-dependency
+# research assumptions.
+#
+# Mirrors the existing report_index/verify completeness asserts: a pure
+# telemetry scan that never blocks a phase, never mutates a finding's
+# severity or disposition, and degrades to a no-op when its source artifacts
+# are absent. Reads `findings_inventory.md` + `verify_*.md` for findings
+# whose severity leans on an `[EXTERNAL-ASSUMPTION: ...]` tag (R10 burden-
+# inversion) or whose Location falls inside a `file:line` recorded in
+# `external_dependency_research.md`'s Integration Surface column (Hook 1's
+# recon-baked research ledger), and flags any such finding that lacks a
+# matching `[EXT-CITED: ...]` reference or a `NEEDS_DEPENDENCY_RESEARCH`
+# escalation line. Writes `external_research_gaps.md`.
+# ─────────────────────────────────────────────────────────────────────────
+
+_ERG_FINDING_BLOCK_RE = re.compile(
+    r"(?:^|\n)#{2,3}\s*Finding\s*\[([A-Za-z0-9\-]+)\][^\n]*\n"
+    r"(.*?)(?=\n#{2,3}\s*Finding\s*\[|\Z)",
+    re.DOTALL,
+)
+_ERG_LOCATION_RE = re.compile(r"\*\*Location\*\*:\s*`?([^`\n]+?)`?\s*(?:\n|$)")
+_ERG_SURFACE_ROW_RE = re.compile(
+    r"^\|\s*`?([^|`]+?)`?\s*\|\s*([^|]+?)\s*\|", re.MULTILINE
+)
+_ERG_LOC_TOKEN_RE = re.compile(r"[\w./\\-]+\.[A-Za-z]+:L?\d+")
+
+
+def _external_dependency_research_surfaces(
+    scratchpad: Path,
+) -> list[tuple[str, str]]:
+    """Parse `external_dependency_research.md`'s Integration Surface column.
+
+    Returns a list of (dependency, file:line) pairs, one per surface token
+    found in each ledger row. Never raises; returns [] when the ledger is
+    absent or unparseable (recall-neutral no-op — Hook-4 simply has nothing
+    to cross-reference for the location axis, the [EXTERNAL-ASSUMPTION] tag
+    axis still runs independently).
+    """
+    scratchpad = Path(scratchpad)
+    path = scratchpad / "external_dependency_research.md"
+    if not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    out: list[tuple[str, str]] = []
+    for m in _ERG_SURFACE_ROW_RE.finditer(text):
+        dep = m.group(1).strip()
+        if not dep or dep.lower() in (
+            "dependency", "---", "name/namespace", "-", ""
+        ):
+            continue
+        surfaces_cell = m.group(2)
+        for loc in _ERG_LOC_TOKEN_RE.findall(surfaces_cell):
+            out.append((dep, loc))
+    return out
+
+
+def _check_external_research_citation_gaps(scratchpad: Path) -> int:
+    """Hook-4 driver entry: scan for uncited external-assumption findings.
+
+    Never raises. Idempotent (rewrites the ledger from current state each
+    call, so resume never accumulates duplicate rows). Returns the number of
+    gap rows written to `external_research_gaps.md`.
+    """
+    scratchpad = Path(scratchpad)
+    try:
+        surfaces = _external_dependency_research_surfaces(scratchpad)
+    except Exception:
+        surfaces = []
+
+    sources: list[tuple[str, str]] = []  # (source_label, text)
+    inv_path = scratchpad / "findings_inventory.md"
+    if inv_path.exists():
+        try:
+            sources.append(
+                ("findings_inventory.md",
+                 inv_path.read_text(encoding="utf-8", errors="replace"))
+            )
+        except Exception:
+            pass
+    try:
+        for vf in sorted(scratchpad.glob("verify_*.md")):
+            try:
+                sources.append(
+                    (vf.name, vf.read_text(encoding="utf-8", errors="replace"))
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    gap_rows: list[tuple[str, str, str, str]] = []  # fid, dep, location, reason
+    seen_keys: set[tuple[str, str]] = set()
+    for source_label, text in sources:
+        try:
+            for m in _ERG_FINDING_BLOCK_RE.finditer(text):
+                fid = m.group(1).strip()
+                block = m.group(2)
+                has_assumption = "[EXTERNAL-ASSUMPTION" in block
+                loc_m = _ERG_LOCATION_RE.search(block)
+                loc = loc_m.group(1).strip() if loc_m else ""
+                matched_dep = ""
+                if loc:
+                    for dep, surf in surfaces:
+                        if surf and surf in loc:
+                            matched_dep = dep
+                            break
+                if not has_assumption and not matched_dep:
+                    continue
+                if "[EXT-CITED" in block or "NEEDS_DEPENDENCY_RESEARCH" in block:
+                    continue
+                key = (fid, loc or source_label)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                reason = (
+                    "uncited [EXTERNAL-ASSUMPTION] tag" if has_assumption
+                    else "location within a researched external-dependency "
+                         "integration surface, uncited"
+                )
+                gap_rows.append((fid, matched_dep or "(unnamed)", loc or "-", reason))
+        except Exception:
+            continue
+
+    lines = [
+        "# External-Dependency Research Gaps",
+        "",
+        "Hook-4 (Fix B) haltless WARN gate. Findings listed below either carry "
+        "an `[EXTERNAL-ASSUMPTION: ...]` tag or sit at a location inside a "
+        "researched external-dependency integration surface, WITHOUT a "
+        "matching `[EXT-CITED: ...]` citation or `NEEDS_DEPENDENCY_RESEARCH` "
+        "escalation. This never changes a finding's severity or disposition "
+        "— it is an advisory flag only: recommend manual verification of the "
+        "assumed external behavior before relying on the reported severity.",
+        "",
+        "| Finding ID | Dependency | Integration Surface | Reason |",
+        "|------------|------------|----------------------|--------|",
+    ]
+    for fid, dep, loc, reason in gap_rows:
+        lines.append(f"| {fid} | {dep} | `{loc}` | {reason} |")
+    if not gap_rows:
+        lines.append("| (none) | | | no uncited external-assumption findings |")
+    try:
+        (scratchpad / "external_research_gaps.md").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+    except Exception:
+        pass
+    return len(gap_rows)
+
+
+def _append_external_research_appendix_note(
+    scratchpad: Path, project_root: Path
+) -> int:
+    """Surface Hook-4's gap ledger as an Appendix note on the assembled report.
+
+    Reuses the report_floor phase's existing role as the driver-owned,
+    post-assembly `AUDIT_REPORT.md` mutator (the same mechanism that relocates
+    Appendix C content via the material-harm floor) rather than inventing a
+    new report-generation path. Advisory-only: never changes a finding's
+    severity, verdict, or body/appendix disposition — it only appends a note.
+    Idempotent (checks for its own heading before appending). Never raises;
+    a missing ledger, missing report, or any I/O failure is a silent no-op.
+    Returns the number of gap rows surfaced (0 if none / no-op).
+    """
+    scratchpad = Path(scratchpad)
+    project_root = Path(project_root)
+    ledger_path = scratchpad / "external_research_gaps.md"
+    report_path = project_root / "AUDIT_REPORT.md"
+    if not ledger_path.exists() or not report_path.exists():
+        return 0
+    try:
+        ledger_text = ledger_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    rows = re.findall(
+        r"^\|\s*([A-Za-z0-9\-]+)\s*\|.*\|$", ledger_text, re.MULTILINE
+    )
+    # Exclude the "(none)" sentinel row and markdown table divider rows
+    # (`|---|---|...|` — the capture group is all hyphens, which otherwise
+    # false-matches `[A-Za-z0-9\-]+` and would make every EMPTY ledger look
+    # non-empty).
+    rows = [
+        r for r in rows
+        if r and r != "(none)" and not re.fullmatch(r"-+", r)
+    ]
+    if not rows:
+        return 0
+    try:
+        report_text = report_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return 0
+    heading = "## Appendix D: External-Dependency Research Gaps (Advisory)"
+    if heading in report_text:
+        return 0
+    note = (
+        f"\n\n{heading}\n\n"
+        "The following findings rely on an assumed worst-case external-"
+        "dependency behavior (per R10) without a citation to researched "
+        "real-world dependency semantics. This is an advisory note only — it "
+        "does not change any finding's reported severity or disposition. "
+        "Recommend manual verification of the named external dependency's "
+        "actual behavior before relying on the assumed-worst-case severity.\n\n"
+        f"Affected finding(s): {', '.join(sorted(set(rows)))}\n"
+    )
+    try:
+        report_path.write_text(report_text.rstrip("\n") + note, encoding="utf-8")
+    except Exception:
+        return 0
+    return len(rows)
+
+
 def _propagate_dedup_absorbed_to_finding_mapping(scratchpad: Path) -> int:
     """Record dedup-absorbed IDs as constituents of their survivor's hypothesis.
 
@@ -16016,6 +16438,11 @@ def _run_phase_validators(
             log.warning(
                 f"[{phase.name}] enumeration gate skipped (non-blocking): {exc}"
             )
+        # Gate V (Fix A, recall): 3-axis Variant-Family Coverage — see
+        # `_run_gate_v_for_phase` for the full contract. Unconditional (not
+        # Thorough-only, not confidence-gated); no-op without graph/pairs;
+        # never halts.
+        _run_gate_v_for_phase(phase.name, scratchpad)
 
     # --- depth (SC): full validator suite ---
     elif phase.name == "depth" and config["pipeline"] == "sc":
@@ -16242,6 +16669,11 @@ def _run_phase_validators(
             log.warning(
                 f"[{phase.name}] enumeration gate skipped (non-blocking): {exc}"
             )
+        # Gate V (Fix A, recall): 3-axis Variant-Family Coverage — see
+        # `_run_gate_v_for_phase` for the full contract. Unconditional (not
+        # Thorough-only, not confidence-gated); no-op without graph/pairs;
+        # never halts.
+        _run_gate_v_for_phase(phase.name, scratchpad)
 
     # --- late containment check removed (v2.6.2) ---
     # The early containment check (line ~1694) already detects all LLM-written
@@ -18942,6 +19374,33 @@ def main():
                     f"[report_index] coverage seed write failed: {exc!r}"
                 )
 
+            # Gate P (Fix C, recall): content-shaped Promotion Completeness —
+            # see `_run_gate_p_for_report_index` for the full contract. Runs
+            # immediately after the coverage-seed write above so orphan
+            # reconciliation has an accurate "already tracked" ID set.
+            _run_gate_p_for_report_index(scratchpad)
+
+            # Hook-4 (Fix B, recall): haltless WARN gate for uncited
+            # external-dependency research assumptions. Depth/chain/verify
+            # have all completed by this point in the phase order. Pure
+            # telemetry: never mutates a finding's severity/disposition,
+            # never halts. Surfaced as an advisory Appendix note later, in
+            # the report_floor phase (see
+            # `_append_external_research_appendix_note`).
+            try:
+                _erg_n = _check_external_research_citation_gaps(scratchpad)
+                if _erg_n:
+                    log.info(
+                        f"[report_index] external-research citation gate: "
+                        f"{_erg_n} uncited external-assumption finding(s) "
+                        "flagged (see external_research_gaps.md)"
+                    )
+            except Exception as exc:
+                log.warning(
+                    "[report_index] external-research citation gate skipped "
+                    f"(non-blocking): {exc}"
+                )
+
         if config["pipeline"] == "sc" and phase.name == "report_index":
             # PRE-SPAWN repair ONLY. `_repair_sc_report_index_from_prior` returns
             # 0 on a fresh run (no prior report_index.md to repair) — in that case
@@ -19823,6 +20282,29 @@ def main():
                 )
             except Exception as exc:
                 log.warning(f"[report_floor] marker write failed: {exc!r}")
+            # Hook-4 (Fix B, recall): surface the external-research citation
+            # gate's ledger (written in report_index, see
+            # `_check_external_research_citation_gaps`) as an advisory
+            # Appendix note on the assembled AUDIT_REPORT.md. Reuses this
+            # phase's existing role as the driver-owned, post-assembly
+            # report mutator rather than inventing a new report path.
+            # Advisory-only: never changes any finding's severity/verdict/
+            # disposition. Never halts; no-op when the ledger is absent or
+            # empty (mirrors enumeration_gate's no-op contract).
+            try:
+                _erg_surfaced = _append_external_research_appendix_note(
+                    scratchpad, config["project_root"]
+                )
+                if _erg_surfaced:
+                    log.info(
+                        f"[report_floor] surfaced {_erg_surfaced} external-"
+                        "research citation gap(s) as an Appendix note"
+                    )
+            except Exception as exc:
+                log.warning(
+                    f"[report_floor] external-research appendix note skipped "
+                    f"(non-blocking): {exc!r}"
+                )
             checkpoint.mark_completed(phase.name)
             checkpoint.clear_degraded_sentinel(scratchpad, phase.name)
             checkpoint.save(scratchpad)

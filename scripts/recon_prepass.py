@@ -1835,6 +1835,35 @@ def _write_meta_buffer_stub(scratch: Path) -> str:
                                    "# RAG Meta Buffer\n(optional)\n") else "FAILED"
 
 
+def _write_external_dependency_research_stub(scratch: Path) -> str:
+    """Guarantee `external_dependency_research.md` exists before recon runs
+    (Fix B / Hook 1 prereq). Recon is the only phase with live WebSearch/
+    WebFetch/tavily_search AND full attack-surface knowledge; it overwrites
+    this stub with one row per EXTERNAL_DEPENDENCY / NAMED_EXTERNAL_PROTOCOL
+    dependency (TASK 6 detection, TASK 11 research). depth-phase workers run
+    with `--disallowedTools mcp__*` and no live web tools, so they can only
+    READ this baked ledger — a missing file (not just an empty one) would
+    silently look like "nothing to check" instead of "recon never wrote it".
+    Header-only is a valid terminal state when zero dependencies are detected;
+    this stub is ALWAYS replaced-or-kept by recon, never read as-is by a
+    depth worker without a header. Best-effort; never raises."""
+    header = (
+        "# External Dependency Research Ledger\n\n"
+        "> **Status**: [LLM TO ENRICH] Pre-pass stub — no dependencies enumerated yet.\n"
+        "> Recon MUST replace this file: one row per EXTERNAL_DEPENDENCY /\n"
+        "> NAMED_EXTERNAL_PROTOCOL dependency flagged in TASK 6, researched via\n"
+        "> WebSearch/WebFetch/tavily_search (recon has live tool access; depth-phase\n"
+        "> workers do not — they only read this baked ledger). A `FETCH_FAILED` row\n"
+        "> is carried forward, never dropped. If zero dependencies are detected, the\n"
+        "> header-only table below (no data rows) is the correct terminal state.\n\n"
+        "| Dependency | Integration Surface | Assumed Behavior | Real Behavior | "
+        "Source | Conformance | Fetch Status |\n"
+        "|------------|----------------------|-------------------|-----------------|"
+        "--------|-------------|---------------|\n"
+    )
+    return "STUB" if _write_text(scratch / "external_dependency_research.md", header) else "FAILED"
+
+
 # DAML is the first SAST-less ecosystem: there is no static-analysis prepass
 # (no SCIP indexer, no Scout/Slither, DLint is style-only). Recon is fully
 # read-driven — the recon LLM is the sole producer of every artifact via
@@ -2108,7 +2137,8 @@ def _write_mechanical_graph_json(scratch: Path, source: str,
     coverage gate (G2) reads — ecosystem-agnostic, LLM-unclobberable.
 
     var_refs:   { "<qualified var>": {"bare": str, "refs": ["<descriptor>", ...]} }
-    functions:  { "<qualified fn>":  {"bare": str, "loc": str, "callers": ["<descriptor>", ...]} }
+    functions:  { "<qualified fn>":  {"bare": str, "loc": str, "callers": ["<descriptor>", ...],
+                                      "callees": ["<descriptor>", ...] (optional, provider-dependent)} }
 
     A "descriptor" is a string the agent's finding prose can be matched against
     (a bare function/variable name, optionally with a `(file:line)` suffix). Each
@@ -2249,7 +2279,8 @@ def _bake_evm_slither_graph(scratch: Path, proj: Path) -> str:
         var_refs[vk] = {"bare": _bare(vk), "refs": _desc(refs)}
     functions = {
         fk: {"bare": _bare(fk), "loc": fn_loc.get(fk, "?"),
-             "callers": sorted(_bare(ck) for ck in fn_callers.get(fk, set()))}
+             "callers": sorted(_bare(ck) for ck in fn_callers.get(fk, set())),
+             "callees": sorted(_bare(ck) for ck in fn_callees.get(fk, set()))}
         for fk in fn_loc
     }
     _write_mechanical_graph_json(scratch, "slither", var_refs, functions)
@@ -2819,7 +2850,8 @@ def _scip_to_graph_artifacts(scratch: Path, index_path: Path, proj: Path) -> str
         functions = {
             fn: {"bare": fn,
                  "loc": f"{data['path']}:L{data['line']}",
-                 "callers": sorted(callers.get(fn, []))}
+                 "callers": sorted(callers.get(fn, [])),
+                 "callees": sorted(callees.get(fn, []))}
             for fn, data in fn_info.items()
         }
         _write_mechanical_graph_json(scratch, "scip", var_refs, functions)
@@ -3802,6 +3834,127 @@ def _seed_cross_chain_msg_flag(scratch: Path, proj: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Generic (non-brand) external-dependency marker detection (SC, EVM)
+#
+# Fix B / Hook 1 second channel: `NAMED_EXTERNAL_PROTOCOL` (TASK 6 in the
+# recon prompt) is a closed ~15-name brand regex and misses any custom,
+# unfamous bridge/messenger/pool. This mechanical backup uses a purely
+# STRUCTURAL test — never a protocol/token/contract name (Part-0):
+#   (a) an `interface` is declared (imported or local) with NO corresponding
+#       in-repo `contract` implementation of the same name (i.e. only an ABI
+#       is known, not a vendored function body);
+#   (b) the interface name is NOT a recognized ERC/EIP-standard or OZ/
+#       solmate/solady-class utility name (a small, generic allowlist of
+#       standard interface/utility names — not brands);
+#   (c) an instance of that interface is called with the return value
+#       consumed (`IFoo(addr).bar(...)` used as an expression, not a bare
+#       statement).
+# Sets EXTERNAL_DEPENDENCY (alias NAMED_EXTERNAL_PROTOCOL for back-compat)
+# so INTEGRATION_HAZARD_RESEARCH still fires even when the LLM recon pass
+# misses a custom dependency. Best-effort, non-fatal, bounded.
+# ---------------------------------------------------------------------------
+
+_EVM_INTERFACE_DECL_RE = re.compile(r"\binterface\s+([A-Za-z_]\w*)\b")
+_EVM_CONTRACT_DECL_RE = re.compile(r"\b(?:abstract\s+)?contract\s+([A-Za-z_]\w*)\b")
+
+# Recognized ERC/EIP-standard + OZ/solmate/solady-class utility interface
+# names. Generic (standard names, not protocol brands) — mirrors the plan's
+# explicit "not a recognized stdlib/OZ/solmate-class utility" exclusion.
+_EVM_STDLIB_INTERFACE_NAMES = frozenset({
+    "IERC20", "IERC20Metadata", "IERC20Permit", "IERC721", "IERC721Receiver",
+    "IERC721Metadata", "IERC721Enumerable", "IERC1155", "IERC1155Receiver",
+    "IERC1155MetadataURI", "IERC165", "IERC2612", "IERC2981", "IERC4626",
+    "IERC777", "IERC777Recipient", "IERC777Sender", "IWETH", "IWETH9",
+    "IMulticall", "IMulticall3", "IOwnable", "IAccessControl", "IPausable",
+    "IPermit2", "IUniswapV2ERC20",
+})
+
+_MAX_EXTERNAL_DEPENDENCY_MARKERS = 10
+
+
+def _detect_external_dependency_markers(proj: Path) -> List[Tuple[str, str]]:
+    """Scan production `.sol` source for the 3-part structural test above.
+
+    Returns up to `_MAX_EXTERNAL_DEPENDENCY_MARKERS` (interface_name,
+    file:line) pairs. Best-effort and non-fatal: any read/regex failure
+    yields an empty (or partial) result, never raises.
+    """
+    out: List[Tuple[str, str]] = []
+    try:
+        files = _production_source_files(proj, (".sol",))
+        if not files:
+            return out
+        interface_decls: Dict[str, str] = {}
+        contract_impls: set = set()
+        texts: Dict[Path, str] = {}
+        for f in files:
+            text = _read_text(f)
+            if not text:
+                continue
+            texts[f] = text
+            for m in _EVM_INTERFACE_DECL_RE.finditer(text):
+                name = m.group(1)
+                interface_decls.setdefault(name, f"{_rel(f, proj)}:L{_line_of(text, m.start())}")
+            for m in _EVM_CONTRACT_DECL_RE.finditer(text):
+                contract_impls.add(m.group(1))
+        for name, loc in sorted(interface_decls.items()):
+            if name in _EVM_STDLIB_INTERFACE_NAMES or name in contract_impls:
+                continue  # recognized utility, or a real in-repo impl exists
+            call_re = re.compile(rf"\b{re.escape(name)}\s*\([^)]*\)\s*\.\s*\w+\s*\(")
+            if any(call_re.search(text) for text in texts.values()):
+                out.append((name, loc))
+            if len(out) >= _MAX_EXTERNAL_DEPENDENCY_MARKERS:
+                break
+    except Exception:
+        return out
+    return out
+
+
+def _seed_external_dependency_flag(scratch: Path, proj: Path) -> str:
+    """If a generic (non-brand) external dependency is detected, mark
+    INTEGRATION_HAZARD_RESEARCH Required=YES and emit the EXTERNAL_DEPENDENCY
+    (alias NAMED_EXTERNAL_PROTOCOL) flag into the recon artifacts.
+
+    Thin caller of `_seed_mechanical_flag` — see that function for the shared
+    3-step mechanical dispatch this performs.
+
+    Returns: DETECTED:EXTERNAL_DEPENDENCY,NAMED_EXTERNAL_PROTOCOL | NOT_DETECTED | FAILED:{reason}
+    """
+    try:
+        markers = _detect_external_dependency_markers(proj)
+        if not markers:
+            return "NOT_DETECTED"
+
+        flags = ["EXTERNAL_DEPENDENCY", "NAMED_EXTERNAL_PROTOCOL"]
+        names = ", ".join(f"`{n}` ({loc})" for n, loc in markers)
+        rows_to_flip = {
+            "INTEGRATION_HAZARD_RESEARCH": (
+                "Generic (non-brand, structural) external dependency "
+                f"detected (mechanical): {names}. "
+            ),
+        }
+
+        _seed_mechanical_flag(
+            scratch,
+            rows_to_flip=rows_to_flip,
+            flags=flags,
+            detected_patterns_header="generic external dependency",
+            detected_patterns_body=(
+                "Imported/declared interface(s) with no in-repo implementation "
+                "and a consumed return value, not matching a recognized "
+                "ERC/EIP-standard or OZ/solmate/solady-class utility name: "
+                + names + ". Research obligation routed to "
+                "external_dependency_research.md (TASK 11)."
+            ),
+            summary_note="generic external dependency detected (non-brand, structural)",
+        )
+
+        return "DETECTED:" + ",".join(flags)
+    except Exception as e:
+        return f"FAILED:{e.__class__.__name__}"
+
+
+# ---------------------------------------------------------------------------
 # Wave-2 A6: embedded Move-source detection (L1) -- closes the L1<->Move
 # skill-lane seam. An L1 (Go/Rust node-client) repo can embed a Move-VM
 # execution layer as `.move` sources; those files currently get no Move
@@ -4056,6 +4209,11 @@ def run_recon_prepass(config: dict) -> Dict[str, str]:
     _safe("recon_summary.md",
           lambda: _write_recon_summary_stub(scratch, proj, lang))
     _safe("meta_buffer.md", lambda: _write_meta_buffer_stub(scratch))
+    # Fix B / Hook 1 prereq: guarantee the external-dependency research ledger
+    # exists (header-only if empty) before recon runs, on EVERY pipeline/lang
+    # (SC + L1 + DAML) — depth-phase workers can only read this baked file.
+    _safe("external_dependency_research.md",
+          lambda: _write_external_dependency_research_stub(scratch))
 
     # L1: mechanical Cosmos-SDK / CometBFT framework detection. Runs AFTER
     # template_recommendations.md + recon_summary.md exist so it can flip the
@@ -4075,6 +4233,11 @@ def run_recon_prepass(config: dict) -> Dict[str, str]:
     # via the shared _seed_mechanical_flag helper.
     if pipeline != "l1" and lang == "evm":
         _safe("cross_chain_msg_flag", lambda: _seed_cross_chain_msg_flag(scratch, proj))
+        # Fix B / Hook 1: mechanical second-channel backup to the LLM recon's
+        # own EXTERNAL_DEPENDENCY/NAMED_EXTERNAL_PROTOCOL detection (TASK 6).
+        # Same manifest-priority, non-fatal dispatch as cross_chain_msg_flag.
+        _safe("external_dependency_flag",
+              lambda: _seed_external_dependency_flag(scratch, proj))
 
     # v2.5.0 P2: OpenGrep cross-ecosystem scanner (SC pipelines only).
     # Deferred to the driver pre-breadth hook by default (see run_startup_scanners

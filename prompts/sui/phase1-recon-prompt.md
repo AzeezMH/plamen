@@ -268,7 +268,39 @@ Write to {SCRATCHPAD}/external_production_behavior.md
 
 **If package addresses unavailable**: Mark all external deps as 'UNVERIFIED', add severity note (Rule 4 adversarial assumption), set severity floor MEDIUM for HIGH worst-case.
 
-Return: 'DONE: design_context.md, external_production_behavior.md written. Fork ancestry: {found/none}. External packages: {N} verified, {M} unverified'
+### External Dependency Research Ledger (MANDATORY)
+
+You are the ONLY phase with both live Tavily/web tools AND full attack-surface
+knowledge of every external package call. depth-phase workers run with
+`--disallowedTools mcp__*` and no live web tools — they can only READ the
+ledger you bake here. Do the research now, not later.
+
+For EVERY dependency flagged `NAMED_EXTERNAL_PROTOCOL` or `EXTERNAL_DEPENDENCY`
+in TASK 6 (named or generic), write one row to
+`{SCRATCHPAD}/external_dependency_research.md`:
+
+| Dependency | Integration Surface | Assumed Behavior | Real Behavior | Source | Conformance | Fetch Status |
+|------------|----------------------|-------------------|-----------------|--------|-------------|---------------|
+
+- **Dependency**: package name (or a short descriptive label for a
+  generic/unnamed external package).
+- **Integration Surface**: ALL call sites, `file:line`, comma-separated.
+- **Assumed Behavior**: what the calling code assumes, as coded.
+- **Real Behavior**: researched real semantics (Tavily/web — official docs,
+  verified package source, audit reports).
+- **Source**: URL + fetch date (`fetched {DATE}`), or `verified package
+  source: {address}`.
+- **Conformance**: `MATCH` / `MISMATCH` (flag for depth) / `CHECK`.
+- **Fetch Status**: `OK`, or `FETCH_FAILED:{reason}`.
+
+**Never drop a row.** A failed lookup still gets a row with `Fetch Status:
+FETCH_FAILED:{reason}` and `Conformance: CHECK` — carried forward, never
+silently omitted.
+
+Write to `{SCRATCHPAD}/external_dependency_research.md`. If NO dependencies
+were flagged in TASK 6, still write the file with only the header row.
+
+Return: 'DONE: design_context.md, external_production_behavior.md, external_dependency_research.md written. Fork ancestry: {found/none}. External packages: {N} verified, {M} unverified'
 ")
 ```
 
@@ -707,6 +739,13 @@ Grep in .move source files (exclude build/, tests/ directories):
 | `ecdsa_k1::secp256k1_verify\|ed25519::ed25519_verify\|ecdsa_r1\|hash::blake2b256\|hmac::hmac_sha3_256` | HAS_SIGNATURES |
 | `approve\|delegate\|allowance\|deposit_for\|stake_for\|delegate_to\|_on_behalf\|_for_user` (public/entry functions with target address parameter writing state for that target) | MULTI_STEP_OPS |
 | External package calls to named protocols in Move.toml deps or use statements: `cetus\|deepbook\|suilend\|navi\|scallop\|turbos\|aftermath\|bucket\|kriya\|flowx\|kai_finance\|haedal\|pyth\|wormhole\|sui_bridge` (EXCLUDE: sui::, sui_framework::, std:: — standard framework modules) | NAMED_EXTERNAL_PROTOCOL |
+| ANY external package call whose implementation is NOT vendored in-repo (only a `Move.toml` dependency or an address-qualified `use` is known), is NOT a recognized framework module (sui::, sui_framework::, std::), AND whose returned object/value is consumed | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
+
+**`EXTERNAL_DEPENDENCY` is a GENERIC, non-brand mechanical trigger** — the row
+above (`NAMED_EXTERNAL_PROTOCOL`) only fires for ~15 named protocol packages
+and misses every custom/unfamous external package. Every dependency that sets
+EXTERNAL_DEPENDENCY or NAMED_EXTERNAL_PROTOCOL gets a row in the External
+Dependency Research Ledger in TASK 11.
 
 Write to {SCRATCHPAD}/detected_patterns.md with format:
 ```markdown

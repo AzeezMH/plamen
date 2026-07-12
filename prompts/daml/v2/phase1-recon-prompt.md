@@ -356,12 +356,22 @@ Grep in `.daml` source files (exclude `.daml/` cache):
 | `getTime`/deadline/`expiry`/`maturity` field or `assert` against time | DEADLINE |
 | `Propose`/`Accept`/`Offer`/`Request` template+choice pairs | MULTI_STEP_OPS |
 | `data-dependencies` in daml.yaml referencing an external `.dar` | NAMED_EXTERNAL_PROTOCOL |
+| `exercise`/`exerciseByKey`/`fetch` targeting a `ContractId`/interface whose implementing template has NO in-repo `template` definition (only imported via `data-dependencies` in daml.yaml), AND whose choice return value or fetched field is consumed (bound in a `do` block, branched on, or used to update a value-bearing field) | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
 | `fromInterfaceContractId`/`coerceContractId` | INTERFACE_COERCION |
 | 2+ in-scope templates sharing a field/formula/key | HAS_MULTI_TEMPLATE |
 | DOCUMENTATION non-empty with testable claims | HAS_DOCS |
 | `split`/`merge`/`transfer` + share/allocation/`pro-rata` | SHARE_ALLOCATION |
 | fee/rate/cap/emission/`multiplier` as a template field | MONETARY_PARAMETER |
 | operator/admin/owner party as a signatory/controller | SEMI_TRUSTED_ROLE |
+
+**`EXTERNAL_DEPENDENCY` is a GENERIC, non-brand mechanical trigger** — the row
+above (`NAMED_EXTERNAL_PROTOCOL`) only fires on the presence of ANY
+`data-dependencies` entry and does not distinguish which imported template's
+choices are actually consumed. The test here is structural, never a name: (a)
+no in-repo template implementation, (b) the choice result / fetched field is
+consumed. Every dependency that sets EXTERNAL_DEPENDENCY or
+NAMED_EXTERNAL_PROTOCOL gets a row in the External Dependency Research Ledger
+in TASK 11 below.
 
 Write to {SCRATCHPAD}/detected_patterns.md
 
@@ -519,6 +529,40 @@ For EACH external package the protocol depends on via `daml.yaml` `data-dependen
 6. **Mark all external deps UNVERIFIED** (no on-chain addresses to confirm): add severity note (Rule 4 adversarial assumption), set severity floor MEDIUM for HIGH worst-case where a cross-package call's behavior is unknown.
 
 Write to {SCRATCHPAD}/external_production_behavior.md
+
+### External Dependency Research Ledger (MANDATORY)
+
+You are the ONLY phase with both live Tavily/WebSearch/WebFetch AND full
+attack-surface knowledge of every cross-package `data-dependencies` surface.
+depth-phase workers run with `--disallowedTools mcp__*` and no live web
+tools — they can only READ the ledger you bake here. Do the research now,
+not later.
+
+For EVERY dependency flagged `NAMED_EXTERNAL_PROTOCOL` or `EXTERNAL_DEPENDENCY`
+in TASK 6 (named or generic), write one row to
+`{SCRATCHPAD}/external_dependency_research.md`:
+
+| Dependency | Integration Surface | Assumed Behavior | Real Behavior | Source | Conformance | Fetch Status |
+|------------|----------------------|-------------------|-----------------|--------|-------------|---------------|
+
+- **Dependency**: `.dar`/library name (or a short descriptive label for a
+  generic/unidentified external dependency).
+- **Integration Surface**: ALL `exercise`/`exerciseByKey`/`fetch` call sites,
+  `file:line`, comma-separated.
+- **Assumed Behavior**: what the calling code assumes, as coded.
+- **Real Behavior**: researched real semantics (Tavily/WebSearch/WebFetch —
+  official docs, library release notes, audit reports).
+- **Source**: URL + fetch date (`fetched {DATE}`), or `UNVERIFIED: no
+  on-chain address to confirm`.
+- **Conformance**: `MATCH` / `MISMATCH` (flag for depth) / `CHECK`.
+- **Fetch Status**: `OK`, or `FETCH_FAILED:{reason}`.
+
+**Never drop a row.** A failed lookup still gets a row with `Fetch Status:
+FETCH_FAILED:{reason}` and `Conformance: CHECK` — carried forward, never
+silently omitted.
+
+Write to `{SCRATCHPAD}/external_dependency_research.md`. If NO dependencies
+were flagged in TASK 6, still write the file with only the header row.
 
 ---
 

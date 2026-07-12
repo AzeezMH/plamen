@@ -373,8 +373,17 @@ Grep in program .rs files (exclude target/, tests/, node_modules/, .anchor/):
 | `ed25519_program\|Secp256k1\|verify_signature\|Signature\|ed25519_instruction\|Secp256k1Program` | HAS_SIGNATURES |
 | `approve\|delegate\|authorized_amount\|deposit_for\|stake_for\|delegate_to\|_on_behalf\|_for_user\|mint_to(.*target\|transfer(.*target` (public instructions with target address/pubkey parameter writing state for that target) | MULTI_STEP_OPS |
 | CPI targets to known program IDs or named protocol crates: `jupiter\|marinade\|raydium\|orca\|drift\|solend\|marginfi\|mango\|phoenix\|kamino\|tensor\|metaplex\|jito\|spl_stake_pool\|pyth_sdk\|switchboard` (EXCLUDE: anchor_lang, spl_token, solana_program " standard framework crates) | NAMED_EXTERNAL_PROTOCOL |
+| ANY CPI target / imported crate dependency whose implementation is NOT vendored in-repo (only a program ID / external `Cargo.toml` dependency is known, no local source with a real instruction body), is NOT a recognized framework crate (anchor_lang, spl_token, solana_program, spl_associated_token_account), AND whose returned account data / CPI result is consumed (deserialized, branched on, or used to move lamports/tokens/state) | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
 
 Write to {SCRATCHPAD}/detected_patterns.md
+
+**`EXTERNAL_DEPENDENCY` is a GENERIC, non-brand mechanical trigger** — the row
+above (`NAMED_EXTERNAL_PROTOCOL`) only fires for ~15 famous program/crate
+names and misses every custom/unfamous CPI target. The test is structural,
+never a name: (a) no in-repo instruction implementation, (b) not a standard
+framework crate, (c) returned data/CPI result is consumed. Every dependency
+that sets EXTERNAL_DEPENDENCY or NAMED_EXTERNAL_PROTOCOL gets a row in the
+External Dependency Research Ledger in TASK 11 below.
 
 ## TASK 7: Prep Artifacts
 
@@ -545,6 +554,40 @@ For EACH critical external program the protocol CPIs into:
 Write to {SCRATCHPAD}/external_production_behavior.md
 
 **If program IDs unavailable**: Mark all external deps as 'UNVERIFIED', add severity note (Rule 4 adversarial assumption), set severity floor MEDIUM for HIGH worst-case.
+
+### External Dependency Research Ledger (MANDATORY)
+
+You are the ONLY phase with both live WebSearch/WebFetch/tavily_search AND
+full attack-surface knowledge of every CPI target. depth-phase workers run
+with `--disallowedTools mcp__*` and no live web tools — they can only READ
+the ledger you bake here. Do the research now, not later.
+
+For EVERY dependency flagged `NAMED_EXTERNAL_PROTOCOL` or `EXTERNAL_DEPENDENCY`
+in TASK 6 (named or generic), write one row to
+`{SCRATCHPAD}/external_dependency_research.md`:
+
+| Dependency | Integration Surface | Assumed Behavior | Real Behavior | Source | Conformance | Fetch Status |
+|------------|----------------------|-------------------|-----------------|--------|-------------|---------------|
+
+- **Dependency**: program/crate name (or a short descriptive label for a
+  generic/unnamed CPI target).
+- **Integration Surface**: ALL CPI call sites, `file:line`, comma-separated.
+- **Assumed Behavior**: what the calling code assumes, as coded (infer from
+  how the CPI result/returned account data is consumed).
+- **Real Behavior**: researched real semantics (WebSearch/WebFetch/
+  tavily_search — official docs, verified program source, audit reports).
+- **Source**: URL + fetch date (`fetched {DATE}`), or `verified program
+  source: {program ID}`.
+- **Conformance**: `MATCH` / `MISMATCH` (flag for depth) / `CHECK` (needs
+  depth follow-up).
+- **Fetch Status**: `OK`, or `FETCH_FAILED:{reason}`.
+
+**Never drop a row.** A failed lookup still gets a row with `Fetch Status:
+FETCH_FAILED:{reason}` and `Conformance: CHECK` — carried forward, never
+silently omitted.
+
+Write to `{SCRATCHPAD}/external_dependency_research.md`. If NO dependencies
+were flagged in TASK 6, still write the file with only the header row.
 
 ---
 

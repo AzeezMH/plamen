@@ -368,6 +368,15 @@ Grep in contract .rs files (exclude target/, tests/, node_modules/, .stellar/):
 | (2+ contract crates in Cargo workspace members within scope) | HAS_MULTI_CONTRACT |
 | CPI targets to known protocol contract addresses or named crates: `soroswap\|phoenix\|blend\|aquarius\|comet` (EXCLUDE: soroban-sdk, soroban-token-sdk, stellar-xdr " standard SDK crates) | NAMED_EXTERNAL_PROTOCOL |
 | `deposit_for\|stake_for\|delegate_to\|mint_for\|withdraw_for\|on_behalf_of` (public functions writing state for a caller-provided Address target) | MULTI_STEP_OPS |
+| ANY `env.invoke_contract`/`try_invoke_contract` target or Cargo dependency whose implementation is NOT vendored in-repo (only a contract address / external crate dependency is known, no local source with a real function body), is NOT a recognized SDK crate (soroban-sdk, soroban-token-sdk, stellar-xdr), AND whose returned value is consumed (assigned, branched on, or used to move balances/state) | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
+
+**`EXTERNAL_DEPENDENCY` is a GENERIC, non-brand mechanical trigger** — the row
+above (`NAMED_EXTERNAL_PROTOCOL`) only fires for ~5 named protocol crates and
+misses every custom/unfamous cross-contract target. The test is structural,
+never a name: (a) no in-repo contract implementation, (b) not a standard SDK
+crate, (c) returned value is consumed. Every dependency that sets
+EXTERNAL_DEPENDENCY or NAMED_EXTERNAL_PROTOCOL gets a row in the External
+Dependency Research Ledger in TASK 11 below.
 
 Write to {SCRATCHPAD}/detected_patterns.md
 
@@ -563,6 +572,39 @@ For EACH critical external contract the protocol invokes via env.invoke_contract
 Write to {SCRATCHPAD}/external_production_behavior.md
 
 **If contract addresses unavailable**: Mark all external deps as 'UNVERIFIED', add severity note (Rule 4 adversarial assumption), set severity floor MEDIUM for HIGH worst-case.
+
+### External Dependency Research Ledger (MANDATORY)
+
+You are the ONLY phase with both live Tavily/WebSearch/WebFetch AND full
+attack-surface knowledge of every cross-contract call. depth-phase workers
+run with `--disallowedTools mcp__*` and no live web tools — they can only
+READ the ledger you bake here. Do the research now, not later.
+
+For EVERY dependency flagged `NAMED_EXTERNAL_PROTOCOL` or `EXTERNAL_DEPENDENCY`
+in TASK 6 (named or generic), write one row to
+`{SCRATCHPAD}/external_dependency_research.md`:
+
+| Dependency | Integration Surface | Assumed Behavior | Real Behavior | Source | Conformance | Fetch Status |
+|------------|----------------------|-------------------|-----------------|--------|-------------|---------------|
+
+- **Dependency**: contract/crate name (or a short descriptive label for a
+  generic/unnamed cross-contract target).
+- **Integration Surface**: ALL `invoke_contract`/`try_invoke_contract` call
+  sites, `file:line`, comma-separated.
+- **Assumed Behavior**: what the calling code assumes, as coded.
+- **Real Behavior**: researched real semantics (Tavily/WebSearch/WebFetch —
+  official docs, verified contract source, audit reports).
+- **Source**: URL + fetch date (`fetched {DATE}`), or `verified contract
+  source: {address}`.
+- **Conformance**: `MATCH` / `MISMATCH` (flag for depth) / `CHECK`.
+- **Fetch Status**: `OK`, or `FETCH_FAILED:{reason}`.
+
+**Never drop a row.** A failed lookup still gets a row with `Fetch Status:
+FETCH_FAILED:{reason}` and `Conformance: CHECK` — carried forward, never
+silently omitted.
+
+Write to `{SCRATCHPAD}/external_dependency_research.md`. If NO dependencies
+were flagged in TASK 6, still write the file with only the header row.
 
 ---
 

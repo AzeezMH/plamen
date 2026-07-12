@@ -115,6 +115,8 @@ __all__ = [
     "write_hibernation_marker",
     "write_inventory_chunk_placeholder",
     "write_report_tier_placeholder",
+    "compute_promotion_orphans",
+    "route_promotion_orphans",
 ]
 
 
@@ -4325,6 +4327,897 @@ def apply_material_harm_floor(scratchpad: Path, project_root: str) -> dict:
         f"to {_FLOOR_APPENDIX_HEADING.split(':',1)[0]}: {', '.join(ids[:10])}"
     )
     return {"moved": len(moved), "ids": ids}
+
+
+# =========================================================================
+# Gate P — content-shaped Promotion Completeness (Class C pipeline-loss)
+# =========================================================================
+#
+# Replaces the v2.8.9 ID-pattern feeder harvest (86% net-noise: promoted on
+# bare ID-token presence with no harm signal) with a CONTENT-SHAPED harvest:
+# a candidate only counts when it carries a real (file:Lnnn location +
+# mechanism cue + enough descriptive text) — bare "[XX-5]"-shaped noise with
+# no location/mechanism never becomes a candidate at all. Destination (BODY /
+# Appendix C / Appendix A) is decided by the EXISTING material-harm classifier
+# (`classify_body_or_appendix`, the same primitive `write_disposition_md` /
+# `enforce_material_harm_floor` already use), never by the harvester itself —
+# this is the one routing choice that fixes v2.8.9's noise (promotion signal
+# = Material-Harm classifier, destination = disposition router).
+#
+# Recall-safe: a harvested candidate is never dropped — it lands in exactly
+# one of BODY-candidate / Appendix-C staging / Appendix-A staging.
+# Precision-safe: BODY candidates are appended to findings_inventory.md as
+# NEEDS_VERIFICATION (never body-at-severity directly) — the existing
+# verify-the-positives pipeline adjudicates before anything can reach the
+# report body.
+# Idempotent + append-only + bounded: mirrors enumeration_gate.py's receipt
+# discipline and per-run caps so a flood of shallow candidates cannot inflate
+# the body.
+# No-overfit: pure shape/content mechanics (a location pattern + generic,
+# HOW-shaped mechanism vocabulary); no protocol/token/contract name in logic
+# or fixtures.
+#
+# `compute_promotion_orphans` / `route_promotion_orphans` are pure, driver-
+# wireable callables — this module never calls itself from a phase hook; the
+# driver owner wires the call sites (mirrors enumeration_gate.py's contract).
+
+_PROMO_MAX_FILES = 60           # bound files scanned per run (recall-safe cap)
+_PROMO_MAX_PER_FILE = 12        # bound candidates harvested per feeder file
+_PROMO_MAX_PER_RUN = 30         # global bound on emitted candidates per run
+# A harvested feeder block whose location already sits within this many lines of a
+# promoted finding (in findings_inventory.md) is treated as ALREADY-PROMOTED (it was
+# consolidated under a report ID), NOT a pipeline-loss orphan. Tolerates the line drift
+# consolidation introduces. Precision guard: prevents re-flagging already-reported
+# findings whose raw depth-agent ID (DE-N/DA2-N) is not carried in the coverage seed
+# (the seed tracks hypothesis/report IDs only, with no locations).
+_PROMO_LOC_WINDOW = 30
+_PROMO_LOC_RE = re.compile(
+    r"([A-Za-z0-9_][A-Za-z0-9_./\-]*\.(?:rs|sol|move|go|py|cairo)):L?(\d+)(?:\s*-\s*L?(\d+))?",
+    re.I,
+)
+_PROMO_MIN_TEXT_LEN = 30        # minimum descriptive-text length to count as "shaped"
+
+_PROMO_FEEDER_GLOBS: tuple = (
+    "depth_*.md",
+    "blind_spot_*.md",
+    "analysis_*.md",
+    "analysis_percontract_*.md",
+    "analysis_rescan_*.md",
+    "scanner_*.md",
+    "niche_*.md",
+    "*_percontract_*.md",
+    "validation_sweep*.md",
+    "design_stress_findings.md",
+    "sibling_propagation_findings.md",
+    "skill_execution_gaps.md",
+    "checklist*.md",
+)
+
+# Artifacts Gate P must never re-harvest: its own output (prevents a
+# harvest-loop on the ledgers/receipts it writes) plus report/inventory
+# artifacts the normal pipeline already owns.
+_PROMO_EXCLUDE_NAMES: frozenset = frozenset({
+    "findings_inventory.md",
+    "report_index_coverage_seed.md",
+    "promotion_orphans.md",
+    "promotion_routing.md",
+    "promotion_orphans_appendix_c.md",
+    "promotion_orphans_appendix_a.md",
+    "promotion_gate_receipt.md",
+})
+
+_PROMO_LOCATION_RE = re.compile(
+    r"\b[\w][\w./\\-]*\.(?:sol|rs|move|go|py|ts|js|jsx|tsx)\s*:\s*L?\d+"
+    r"(?:\s*[-–]\s*L?\d+)?\b",
+    re.IGNORECASE,
+)
+
+# Generic, HOW-shaped defect-mechanism vocabulary (no protocol/function names)
+# — mirrors the style of the pipeline's existing `_GUARD_ABSENCE_CUE` /
+# `_HARM_CONSEQUENCE_RE` cue lists. This is the harvest-side precision gate:
+# bare ID-token text with no mechanism wording never becomes a candidate.
+_PROMO_MECHANISM_CUE_RE = re.compile(
+    r"(?i)\b(?:missing|lacks?|no\s+(?:check|guard|validation)|"
+    r"does\s+not\s+(?:check|validate|verify|update|emit|revert|reset)|"
+    r"fails?\s+to\s+(?:check|validate|update|emit|revert|reset)|"
+    r"unchecked|un-?gated|not\s+gated|"
+    r"incorrect(?:ly)?|allows?\s+|permits?\s+|"
+    r"overflow|underflow|reentran\w*|"
+    r"can\s+be\s+(?:bypassed|manipulated|drained|exploited)|"
+    r"race\s+condition|stale\b|out[-\s]of[-\s]date|"
+    r"never\s+(?:checked|validated|updated|reset)|"
+    r"truncat\w*|mismatch\w*|misrout\w*|drain\w*|corrupt\w*|"
+    r"desync\w*|inconsistent\w*|bypass\w*|manipulat\w*"
+    r")\b"
+)
+
+_PROMO_REFUTED_RE = re.compile(
+    r"(?i)\b(?:REFUTED|FALSE[_\s-]?POSITIVE|DROP_FALSE_POSITIVE|"
+    r"not\s+exploitable|not\s+a\s+(?:bug|vulnerability|real\s+issue)|"
+    r"safe\s+by\s+design|working\s+as\s+intended|intended\s+behavior|"
+    r"design\s+confirmation)\b"
+)
+
+# A heading that is a METHODOLOGY / meta / bookkeeping section, never a finding.
+# A real finding block is titled with a bug ("Finding [X]: ...", or a defect
+# description) — never one of these process artifacts. Applied to the block's own
+# heading line only, so it cannot suppress a finding that merely MENTIONS these words
+# in its body. Deliberately EXCLUDES "CHECK N" (real blind-spot findings title as
+# "CHECK 5 - <bug>: CONFIRMED"); the negative-disposition filter below handles the
+# "CHECK N - no finding / rationale" case instead.
+_PROMO_META_HEADING_RE = re.compile(
+    r"(?i)(semantic\s+proof\s+check|obligation\s+receipt|exclusion\s+list|"
+    r"pre-?condition\s+analysis|post-?condition\s+analysis|step\s+execution\s+checklist|"
+    r"chain\s+summary|rules?\s+applied|depth\s+evidence|file\s+coverage|"
+    r"coverage\s+checkpoint|self[-\s]?check|scope\s+containment|"
+    r"analysis\s+methodology|methodology\b)"
+)
+
+# A NEGATIVE / no-finding / correct-usage disposition — the block itself concludes
+# there is NO issue, so it is not a pipeline-loss candidate. Applied to the whole
+# block. Kept specific so it does not match a real finding that says "does X correctly
+# but fails Y" (only "correct <noun> usage", not a bare "correctly").
+_PROMO_NEG_DISPOSITION_RE = re.compile(
+    r"(?i)(no\s+additional\s+finding|no\s+finding\b|not\s+a\s+finding|"
+    r"\bDONE\b\s*[-–—:]?\s*CORRECT|correct\s+\w*\s*usage|"
+    r"no\s+(?:issue|bug|vulnerabilit)\w*|\bis\s+safe\b)"
+)
+
+# "dup of X-NN" / "duplicate of X-NN" — a cited referent means the EXCLUDED
+# stub is a legitimate dedup, not pipeline-loss; only REFERENT-LESS stubs are
+# candidates (exactly where a suppressed real bug hides per orchestrator-
+# rules.md's own EXCLUSION SOURCE RULE).
+_PROMO_DUP_REFERENT_RE = re.compile(r"(?i)\bdup(?:licate)?\s+of\b")
+
+_PROMO_EXCLUDED_STUB_RE = re.compile(
+    r"(?im)^\s*EXCLUDED\s*\[([A-Za-z0-9_\-]+)\]\s*(.*)$"
+)
+
+_PROMO_ID_TOKEN_RE = re.compile(r"^\[?([A-Za-z]{1,10}-?\d+)\]?")
+
+
+def _promo_seed_ids(scratchpad: Path) -> tuple[set[str], dict[str, str]]:
+    """Parse ``report_index_coverage_seed.md`` -> ``({all IDs}, {ID: verdict})``.
+
+    The caller treats a MISSING seed file as the no-op advisory condition
+    (mirrors `enumeration_gate._load_graph` returning ``None``): Gate P has no
+    reconciliation ledger to check orphans against, so it does not harvest.
+    """
+    p = Path(scratchpad) / "report_index_coverage_seed.md"
+    if not p.exists():
+        return set(), {}
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return set(), {}
+    ids: set[str] = set()
+    verdicts: dict[str, str] = {}
+    for line in text.splitlines():
+        m = re.match(r"^\|\s*([A-Za-z0-9_\-]+)\s*\|\s*([^|]*)\|\s*([^|]*)\|", line)
+        if not m:
+            continue
+        fid = m.group(1).strip().upper()
+        if not fid or not re.search(r"[A-Za-z]", fid) or fid == "FINDING/HYP ID":
+            continue
+        ids.add(fid)
+        verdicts[fid] = m.group(3).strip()
+    return ids, verdicts
+
+
+def _promo_covered_locations(scratchpad: Path) -> dict[str, list[tuple[int, int]]]:
+    """Parse every ``file:line[-line]`` in ``findings_inventory.md`` ->
+    ``{normalized_path: [(lo, hi), ...]}``.
+
+    findings_inventory.md is the CONSOLIDATED promoted set: every reported finding
+    traces to an inventory entry carrying a ``**Location**`` field. A harvested feeder
+    block whose location overlaps one of these was consolidated under a report ID and
+    is therefore NOT a pipeline-loss. This is the location-based reconciliation the
+    coverage seed cannot provide (the seed carries hypothesis/report IDs only, no
+    locations, and never the raw depth-agent IDs the feeders use). Bounded read, never
+    raises.
+    """
+    out: dict[str, list[tuple[int, int]]] = {}
+    p = Path(scratchpad) / "findings_inventory.md"
+    if not p.exists():
+        return out
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return out
+    for m in _PROMO_LOC_RE.finditer(text):
+        f = m.group(1).strip().strip("`").lower()
+        lo = int(m.group(2))
+        hi = int(m.group(3)) if m.group(3) else lo
+        if hi < lo:
+            lo, hi = hi, lo
+        out.setdefault(f, []).append((lo, hi))
+    return out
+
+
+def _promo_location_is_covered(cand: dict, covered: dict) -> bool:
+    """True if ANY ``file:line`` reference in the candidate's location/title/text
+    overlaps (within ``_PROMO_LOC_WINDOW``) a promoted finding's location in the same
+    file — i.e. the candidate was already consolidated into a reported finding.
+
+    Recall-safe: with no covered map (inventory absent) this returns False, so nothing
+    is suppressed. Precision guard only.
+    """
+    if not covered:
+        return False
+    hay = "\n".join(
+        str(cand.get(k, "") or "") for k in ("location", "title", "text")
+    )
+    for m in _PROMO_LOC_RE.finditer(hay):
+        f = m.group(1).strip().strip("`").lower()
+        ranges = covered.get(f)
+        if not ranges:
+            continue
+        lo = int(m.group(2))
+        hi = int(m.group(3)) if m.group(3) else lo
+        if hi < lo:
+            lo, hi = hi, lo
+        for (clo, chi) in ranges:
+            if lo <= chi + _PROMO_LOC_WINDOW and hi >= clo - _PROMO_LOC_WINDOW:
+                return True
+    return False
+
+
+def _promo_shape_ok(text: str) -> tuple[bool, str]:
+    """Content-shape test: a real location + a mechanism cue + enough text.
+
+    This is the precision gate that keeps bare ID-pattern noise (the v2.8.9
+    class of "noise") from ever becoming a harvested candidate — the harvest
+    signal is CONTENT shape, not ID-token presence.
+    """
+    if not text or len(text.strip()) < _PROMO_MIN_TEXT_LEN:
+        return False, ""
+    # reject methodology / meta / bookkeeping section headers (never a finding)
+    first_line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    if _PROMO_META_HEADING_RE.search(first_line):
+        return False, ""
+    # reject blocks that conclude NO issue (no-finding / correct-usage). REFUTED
+    # blocks are NOT rejected here — they are real findings that were disproven, and
+    # _promo_disposition routes them to Appendix A (excluded), preserving the trail.
+    if _PROMO_NEG_DISPOSITION_RE.search(text):
+        return False, ""
+    loc_m = _PROMO_LOCATION_RE.search(text)
+    if not loc_m:
+        return False, ""
+    if not _PROMO_MECHANISM_CUE_RE.search(text):
+        return False, ""
+    return True, loc_m.group(0).strip()
+
+
+_PROMO_HEADING_RE = re.compile(r"^\s*#{2,4}\s+(.*)$")
+
+# Broad, generic bracketed-ID token — deliberately independent of the strict
+# internal-ID catalog (`_ID_DEPTH_ALTS` et al. in plamen_parsers.py). That
+# catalog is missing several real internal prefixes report-template.md itself
+# names as internal (bare `DE-`, `DS-`, `DT-`), so a heading like
+# ``## Finding [DE-11]: ...`` silently produces ZERO blocks from
+# `_inventory_blocks()` — exactly the "coverage exists but the mechanism
+# cannot detect its own non-fulfillment" pipeline-loss class Gate P exists to
+# catch. Gate P's harvest is CONTENT-shaped, not ID-pattern-shaped, so its own
+# block splitter must not depend on that catalog being complete.
+_PROMO_BLOCK_ID_RE = re.compile(r"\[([A-Za-z]{1,10}\d*-\d+)\]")
+
+
+def _promo_split_heading_blocks(text: str) -> list[dict]:
+    """Fence-aware split on level-2/3/4 markdown headings.
+
+    Mirrors `_inventory_blocks`'s fence-awareness (code blocks containing
+    markdown-style headings are not treated as finding starts) but extracts
+    the heading's bracketed ID token with a broad generic regex instead of
+    the strict internal-ID catalog, so it never silently drops a
+    finding-shaped block over an unrecognized ID prefix.
+    """
+    try:
+        text = _llm_norm(text)
+    except Exception:
+        pass
+    lines = text.splitlines()
+    starts: list[tuple[int, str]] = []
+    in_fence = False
+    fence_marker: str | None = None
+    for idx, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+                fence_marker = None
+            continue
+        if in_fence:
+            continue
+        if _PROMO_HEADING_RE.match(line):
+            starts.append((idx, line))
+    out: list[dict] = []
+    for i, (start, heading_line) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(lines)
+        block = "\n".join(lines[start:end]).strip()
+        hm = _PROMO_HEADING_RE.match(heading_line)
+        raw_title = hm.group(1) if hm else heading_line
+        idm = _PROMO_BLOCK_ID_RE.search(raw_title)
+        orig_id = idm.group(1).strip().upper() if idm else ""
+        title = re.sub(r"(?i)^Finding\b\s*", "", raw_title).strip()
+        if idm:
+            title = title.replace(idm.group(0), "").strip()
+        title = re.sub(r"^\s*[:=\-–—#]+\s*", "", title).strip()
+        out.append({"id": orig_id, "title": title, "block": block})
+    return out
+
+
+def _promo_harvest_finding_blocks(path: Path, text: str) -> list[dict]:
+    """Hiding spot 1: full ``## Finding [ID]: Title`` blocks (depth_* /
+    blind_spot_* / analysis_* / *_percontract_* / niche_* etc.) that never
+    received a report ID — the "unpromoted feeder block" class."""
+    out: list[dict] = []
+    try:
+        blocks = _promo_split_heading_blocks(text)
+    except Exception:
+        return out
+    for b in blocks:
+        block_text = b.get("block", "") or ""
+        ok, loc = _promo_shape_ok(block_text)
+        if not ok:
+            continue
+        location = ""
+        try:
+            location = (_field_from_markdown(block_text, ("Location", "Locations")) or "").strip()
+        except Exception:
+            location = ""
+        location = location or loc
+        out.append({
+            "source_file": path.name,
+            "shape": "finding_block",
+            "orig_id": (b.get("id") or "").strip().upper(),
+            "title": b.get("title") or "Untitled finding",
+            "location": location,
+            "text": block_text,
+        })
+    return out
+
+
+def _promo_harvest_table_rows(path: Path, text: str) -> list[dict]:
+    """Hiding spot 2: markdown pipe-table rows (checklist cells, summary-table
+    rows) that describe a defect inline without their own finding heading."""
+    out: list[dict] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("|"):
+            continue
+        stripped_chars = set(s.replace("|", "").strip())
+        if not stripped_chars or stripped_chars <= {"-", ":", " "}:
+            continue  # table separator row
+        ok, loc = _promo_shape_ok(s)
+        if not ok:
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        orig_id = ""
+        if cells:
+            idm = _PROMO_ID_TOKEN_RE.match(cells[0])
+            if idm:
+                orig_id = idm.group(1).strip().upper()
+        # Title: prefer the cell carrying the mechanism/harm prose (not the
+        # bare ID cell or the location cell, so Location doesn't get echoed
+        # into Title AND Description on emission). Falls back to the whole
+        # row if no cell independently matches the mechanism cue.
+        title_cell = ""
+        for c in cells:
+            if _PROMO_LOCATION_RE.fullmatch(c.strip()):
+                continue  # skip a cell that IS just the location
+            if _PROMO_MECHANISM_CUE_RE.search(c):
+                title_cell = c
+                break
+        if not title_cell:
+            candidates = [c for c in cells if not _PROMO_LOCATION_RE.fullmatch(c.strip())]
+            title_cell = max(candidates, key=len) if candidates else s
+        out.append({
+            "source_file": path.name,
+            "shape": "table_row",
+            "orig_id": orig_id,
+            "title": _strip_md(title_cell)[:120],
+            "location": loc,
+            "text": s,
+            # `desc`: the mechanism/harm cell alone, WITHOUT the location
+            # cell — used for the emitted Description so the harvested
+            # location is not echoed twice (once in **Location**, again
+            # inside a raw-row **Description**). `text` (the full row) is
+            # kept for classification/hashing, which benefit from full
+            # context.
+            "desc": title_cell,
+        })
+    return out
+
+
+def _promo_harvest_excluded_stubs(path: Path, text: str) -> list[dict]:
+    """Hiding spot 3: referent-less ``EXCLUDED [ID] ...`` exclusion stubs
+    (the orchestrator-rules.md per-cluster exclusion format). A stub citing a
+    real "dup of X-NN" referent is a legitimate dedup — skipped. Only
+    REFERENT-LESS stubs are candidates: content-bearing ones (own location +
+    mechanism/harm) are harvested normally; content-less ones ("already
+    known" with no location) are still harvested (never dropped) but flagged
+    so the router sends them to human review, not the body."""
+    out: list[dict] = []
+    for m in _PROMO_EXCLUDED_STUB_RE.finditer(text):
+        stub_id = m.group(1).strip()
+        rest = (m.group(2) or "").strip()
+        if _PROMO_DUP_REFERENT_RE.search(rest):
+            continue  # cites a real referent -> legitimate dedup, not orphan
+        ok, loc = _promo_shape_ok(rest)
+        out.append({
+            "source_file": path.name,
+            "shape": "excluded_stub",
+            "orig_id": stub_id.strip().upper(),
+            "title": (rest[:120] if rest else f"Referent-less exclusion {stub_id}"),
+            "location": loc,
+            "text": rest,
+            "content_bearing": ok,
+        })
+    return out
+
+
+def _promo_disposition(cand: dict) -> tuple[str, str]:
+    """Decide BODY / APPENDIX_C / APPENDIX_A for one harvested candidate.
+
+    Reuses the EXISTING material-harm classifier (`classify_body_or_appendix`)
+    — this is the routing choice that fixes v2.8.9's noise: the promotion
+    signal is the classifier, not ID-pattern presence.
+    """
+    text = cand.get("text", "") or ""
+    title = cand.get("title", "") or ""
+    if cand.get("shape") == "excluded_stub" and not cand.get("content_bearing", True):
+        return (
+            "APPENDIX_A",
+            "referent-less exclusion with no recoverable content — flagged "
+            "for human review, not dropped",
+        )
+    if _PROMO_REFUTED_RE.search(f"{title}\n{text}"):
+        return ("APPENDIX_A", "verifier-refuted")
+    verdict = ""
+    try:
+        verdict = _field_from_markdown(text, ("Verdict", "Final Verdict", "Status"))
+    except Exception:
+        verdict = ""
+    if verdict and re.search(r"(?i)refut|false.?positive", verdict):
+        return ("APPENDIX_A", "verifier-refuted")
+    try:
+        disp, reason = classify_body_or_appendix(title, "", text, verdict)
+    except Exception:
+        disp, reason = ("BODY", "default (classifier error — recall-safe)")
+    if disp == "APPENDIX":
+        return ("APPENDIX_C", reason)
+    return ("BODY", reason)
+
+
+def _write_promotion_orphans_md(
+    scratchpad: Path, orphans: list[dict], already_tracked: int, files_scanned: int
+) -> None:
+    lines = [
+        "# Promotion Orphans (Gate P harvest)",
+        "",
+        "Content-shaped harvest of finding-SHAPED blocks (location + mechanism "
+        "+ harm) across feeder artifacts that never received a report ID. Each "
+        "row is routed through the existing material-harm classifier, never "
+        "promoted to body-at-severity directly. Recall-safe: nothing harvested "
+        "here is dropped.",
+        "",
+        f"- Files scanned: {files_scanned} | Already-tracked (report-ID "
+        f"present in the coverage seed): {already_tracked} | Orphans: "
+        f"{len(orphans)}",
+        "",
+        "| Candidate | Source | Shape | Orig ID | Location | Disposition | Reason |",
+        "|-----------|--------|-------|---------|----------|--------------|--------|",
+    ]
+    for c in orphans:
+        title = re.sub(r"\s+", " ", c.get("title", "")).replace("|", "/").strip()[:80]
+        reason = re.sub(r"\s+", " ", c.get("reason", "")).replace("|", "/").strip()
+        loc = (c.get("location") or "-").replace("|", "/")
+        lines.append(
+            f"| {c['candidate_id']} | {c['source_file']} | {c['shape']} | "
+            f"{c.get('orig_id', '') or '-'} | `{loc}` | "
+            f"{c.get('disposition', '')} | {title} — {reason} |"
+        )
+    if not orphans:
+        lines.append("| (none) | | | | | | no orphans found |")
+    try:
+        (scratchpad / "promotion_orphans.md").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+    except Exception as exc:
+        log.warning(f"[promotion-gate] write promotion_orphans.md failed: {exc!r}")
+
+
+def compute_promotion_orphans(scratchpad: Path) -> list[dict]:
+    """Gate P harvest + reconcile (content-shaped, NOT ID-pattern).
+
+    Scans every feeder artifact (`depth_*`, `blind_spot_*`, `analysis_*`,
+    `*_percontract_*`, checklists, exclusion stubs) for finding-SHAPED
+    content — a real `file:Lnnn` location + a generic defect-mechanism cue +
+    enough descriptive text — and reconciles each candidate's own ID (when it
+    has one) against `report_index_coverage_seed.md`. A candidate whose own
+    ID is already in the seed is ALREADY TRACKED by the normal report
+    pipeline and is not re-promoted. Everything else is an ORPHAN: it is
+    classified BODY / APPENDIX_C / APPENDIX_A via the existing material-harm
+    classifier and written to `promotion_orphans.md`.
+
+    No-op advisory when `report_index_coverage_seed.md` is absent (mirrors
+    `enumeration_gate.py`'s graph-absent no-op) — recall-safe: nothing is
+    silently dropped, the gate simply has not run yet. Bounded (per-file and
+    per-run caps) so it can never flood. Never raises.
+    """
+    scratchpad = Path(scratchpad)
+    seed_path = scratchpad / "report_index_coverage_seed.md"
+    if not seed_path.exists():
+        return []
+    try:
+        seed_ids, _seed_verdicts = _promo_seed_ids(scratchpad)
+    except Exception:
+        seed_ids = set()
+    # Location-based reconciliation against the consolidated promoted set. The coverage
+    # seed tracks hypothesis/report IDs (GRP-NN/H-N) with NO locations and never the raw
+    # depth-agent IDs (DE-N/DA2-N) the feeders carry, so an ID-only check re-flags every
+    # already-consolidated finding as a false orphan. Matching the harvested block's
+    # location against inventory locations catches those consolidations. Never raises.
+    try:
+        covered_locs = _promo_covered_locations(scratchpad)
+    except Exception:
+        covered_locs = {}
+
+    files: list[Path] = []
+    seen_paths: set[Path] = set()
+    for pat in _PROMO_FEEDER_GLOBS:
+        try:
+            for p in sorted(scratchpad.glob(pat)):
+                if p.name in _PROMO_EXCLUDE_NAMES or p in seen_paths or not p.is_file():
+                    continue
+                seen_paths.add(p)
+                files.append(p)
+        except Exception:
+            continue
+    files = files[:_PROMO_MAX_FILES]
+
+    orphans: list[dict] = []
+    already_tracked = 0
+    seen_locations: set[tuple] = set()  # intra-run dedup across harvesters
+    for p in files:
+        try:
+            text = _llm_norm(p.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        harvested: list[dict] = []
+        try:
+            harvested.extend(_promo_harvest_finding_blocks(p, text))
+        except Exception:
+            pass
+        try:
+            harvested.extend(_promo_harvest_table_rows(p, text))
+        except Exception:
+            pass
+        try:
+            harvested.extend(_promo_harvest_excluded_stubs(p, text))
+        except Exception:
+            pass
+        per_file = 0
+        for cand in harvested:
+            if per_file >= _PROMO_MAX_PER_FILE or len(orphans) >= _PROMO_MAX_PER_RUN:
+                break
+            orig_id = cand.get("orig_id", "")
+            if orig_id and orig_id in seed_ids:
+                already_tracked += 1
+                continue  # already accounted for by the normal report pipeline
+            if _promo_location_is_covered(cand, covered_locs):
+                already_tracked += 1
+                continue  # consolidated under a report ID at this location (not a loss)
+            dedup_key = (cand["source_file"], cand.get("location", ""), cand["shape"])
+            if dedup_key in seen_locations:
+                continue
+            seen_locations.add(dedup_key)
+            try:
+                disp, reason = _promo_disposition(cand)
+            except Exception:
+                disp, reason = ("BODY", "default (routing error — recall-safe)")
+            cand["disposition"] = disp
+            cand["reason"] = reason
+            orphans.append(cand)
+            per_file += 1
+
+    for i, cand in enumerate(orphans, start=1):
+        cand["candidate_id"] = f"PROMO-{i:03d}"
+
+    try:
+        _write_promotion_orphans_md(scratchpad, orphans, already_tracked, len(files))
+    except Exception as exc:
+        log.warning(f"[promotion-gate] harvest ledger write failed: {exc!r}")
+    return orphans
+
+
+def _write_promotion_routing_md(
+    scratchpad: Path, body_cands: list[dict], appc_rows: list[dict], appa_rows: list[dict]
+) -> None:
+    lines = [
+        "# Promotion Routing (Gate P)",
+        "",
+        "Accounting receipt for how each harvested orphan was routed. BODY -> "
+        "appended to findings_inventory.md as a NEEDS_VERIFICATION candidate "
+        "(never body-at-severity directly). APPENDIX_C -> quality/hardening "
+        "staging (zero security consequence). APPENDIX_A -> verifier-refuted "
+        "or referent-less/content-less staging (human review, never dropped).",
+        "",
+        f"- BODY candidates: {len(body_cands)} | Appendix C: {len(appc_rows)} "
+        f"| Appendix A: {len(appa_rows)}",
+        "",
+        "| Candidate | Source | Shape | Destination | Reason |",
+        "|-----------|--------|-------|-------------|--------|",
+    ]
+    for label, rows in (
+        ("BODY -> findings_inventory.md (NEEDS_VERIFICATION)", body_cands),
+        ("APPENDIX_C -> promotion_orphans_appendix_c.md", appc_rows),
+        ("APPENDIX_A -> promotion_orphans_appendix_a.md", appa_rows),
+    ):
+        for c in rows:
+            reason = re.sub(r"\s+", " ", c.get("reason", "")).replace("|", "/").strip()
+            lines.append(
+                f"| {c['candidate_id']} | {c['source_file']} | {c['shape']} | "
+                f"{label} | {reason} |"
+            )
+    if not (body_cands or appc_rows or appa_rows):
+        lines.append("| (none) | | | | no candidates routed |")
+    try:
+        (scratchpad / "promotion_routing.md").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+    except Exception as exc:
+        log.warning(f"[promotion-gate] write promotion_routing.md failed: {exc!r}")
+
+
+def _write_promotion_appendix_staging(
+    scratchpad: Path, appc_rows: list[dict], appa_rows: list[dict]
+) -> None:
+    def _fmt_rows(rows: list[dict]) -> list[str]:
+        out = []
+        for c in rows:
+            title = re.sub(r"\s+", " ", c.get("title", "")).replace("|", "/").strip()[:100]
+            reason = re.sub(r"\s+", " ", c.get("reason", "")).replace("|", "/").strip()
+            loc = (c.get("location") or "-").replace("|", "/")
+            out.append(f"| {c['candidate_id']} | {title} | `{loc}` | {reason} |")
+        return out
+
+    c_lines = [
+        "# Promotion Gate — Appendix C Staging (Quality & Hardening)",
+        "",
+        "Content-shaped orphans classified as zero-security-consequence (pure "
+        "quality / hardening / observability). Staged here for the "
+        "driver-owned report assembly to merge into Appendix C — never a "
+        "body finding.",
+        "",
+        "| Candidate | Title | Location | Reason |",
+        "|-----------|-------|----------|--------|",
+    ]
+    c_lines.extend(_fmt_rows(appc_rows) or ["| (none) | | | no candidates |"])
+
+    a_lines = [
+        "# Promotion Gate — Appendix A Staging (Excluded / Human Review)",
+        "",
+        "Content-shaped orphans that are either verifier-refuted or "
+        "referent-less exclusion stubs with no recoverable content. Staged "
+        "here for the driver-owned report assembly to merge into Appendix A "
+        "— never dropped, flagged for human review when content-less.",
+        "",
+        "| Candidate | Title | Location | Reason |",
+        "|-----------|-------|----------|--------|",
+    ]
+    a_lines.extend(_fmt_rows(appa_rows) or ["| (none) | | | no candidates |"])
+
+    try:
+        (scratchpad / "promotion_orphans_appendix_c.md").write_text(
+            "\n".join(c_lines) + "\n", encoding="utf-8"
+        )
+        (scratchpad / "promotion_orphans_appendix_a.md").write_text(
+            "\n".join(a_lines) + "\n", encoding="utf-8"
+        )
+    except Exception as exc:
+        log.warning(f"[promotion-gate] appendix staging write failed: {exc!r}")
+
+
+def _append_inventory_blocks(inv_text: str, header: str, lines: list[str]) -> str:
+    """Pure text-append primitive for `findings_inventory.md`.
+
+    Appends an optional section `header` (only non-empty on the FIRST call
+    that introduces the PROMOGAP section — the caller already checks whether
+    the header text is present) followed by the given finding-block `lines`
+    (already flattened: one list entry per markdown line, each candidate's
+    lines ending with a blank-line separator).
+
+    This function performs NO dedup of its own — the caller
+    (`route_promotion_orphans`) is responsible for excluding already-emitted
+    candidates via the receipt before building `lines`, so calling this twice
+    with an empty `lines` list is a safe no-op-shaped append (idempotency is
+    enforced upstream, not here).
+    """
+    text = (inv_text or "").rstrip("\n")
+    if header:
+        text += header if header.startswith("\n") else ("\n\n" + header.lstrip("\n"))
+    else:
+        text += "\n\n"
+    body = "\n".join(lines).rstrip("\n")
+    if body:
+        text += body
+    return text.rstrip("\n") + "\n"
+
+
+def route_promotion_orphans(scratchpad: Path, orphans: "list[dict] | None" = None) -> dict:
+    """Gate P routing: disposition-router for harvested promotion orphans.
+
+    BODY-disposed orphans are appended to `findings_inventory.md` as
+    NEEDS_VERIFICATION candidates (never body-at-severity directly — the
+    existing verify-the-positives pipeline adjudicates before anything can
+    reach the report body). APPENDIX_C / APPENDIX_A orphans are staged into
+    dedicated ledgers (`promotion_orphans_appendix_c.md` /
+    `promotion_orphans_appendix_a.md`) for the driver-owned report assembly
+    to merge — this function never writes AUDIT_REPORT.md itself.
+
+    Idempotent: the `findings_inventory.md` append is gated by a dedicated
+    receipt (`promotion_gate_receipt.md`) keyed on a content hash of each
+    candidate, so a second call on unchanged feeder artifacts appends
+    nothing new. The staging ledgers are deterministic snapshots of the
+    current harvest, so they are naturally idempotent (same input -> same
+    output) without a receipt. Never raises; a failure at any step degrades
+    to the next step running with what succeeded.
+    """
+    scratchpad = Path(scratchpad)
+    if orphans is None:
+        try:
+            orphans = compute_promotion_orphans(scratchpad)
+        except Exception:
+            orphans = []
+    orphans = orphans or []
+    result = {
+        "harvested": len(orphans),
+        "body_candidates": 0,
+        "appendix_c": 0,
+        "appendix_a": 0,
+        "emitted_to_inventory": 0,
+    }
+    if not orphans:
+        try:
+            _write_promotion_routing_md(scratchpad, [], [], [])
+            _write_promotion_appendix_staging(scratchpad, [], [])
+        except Exception:
+            pass
+        return result
+
+    receipt_path = scratchpad / "promotion_gate_receipt.md"
+    seen: set = set()
+    if receipt_path.exists():
+        try:
+            seen = set(re.findall(
+                r"\bPROMOGAP-KEY:\s*(\S+)",
+                receipt_path.read_text(encoding="utf-8", errors="replace"),
+            ))
+        except Exception:
+            seen = set()
+
+    body_cands: list[dict] = []
+    all_body: list[dict] = []
+    appc_rows: list[dict] = []
+    appa_rows: list[dict] = []
+    for cand in orphans:
+        disp = cand.get("disposition", "BODY")
+        try:
+            digest = hashlib.sha1(
+                cand.get("text", "").encode("utf-8", "replace")
+            ).hexdigest()[:10]
+        except Exception:
+            digest = "0"
+        cand["_promo_key"] = (
+            f"{cand.get('source_file','')}:{cand.get('location','')}:"
+            f"{cand.get('shape','')}:{digest}"
+        )
+        if disp == "BODY":
+            all_body.append(cand)
+            if cand["_promo_key"] not in seen:
+                body_cands.append(cand)
+        elif disp == "APPENDIX_C":
+            appc_rows.append(cand)
+        else:
+            appa_rows.append(cand)
+    result["body_candidates"] = len(all_body)
+    result["appendix_c"] = len(appc_rows)
+    result["appendix_a"] = len(appa_rows)
+
+    if body_cands:
+        inv_path = scratchpad / "findings_inventory.md"
+        if inv_path.exists():
+            try:
+                inv_text = inv_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                inv_text = None
+            if inv_text is not None:
+                max_inv = 0
+                for m in re.finditer(r"\bINV-(\d+)\b", inv_text):
+                    try:
+                        max_inv = max(max_inv, int(m.group(1)))
+                    except ValueError:
+                        pass
+                appended_lines: list[str] = []
+                new_keys: list[str] = []
+                for idx, cand in enumerate(body_cands, start=1):
+                    inv_n = max_inv + idx
+                    title = cand.get("title") or "Untitled promotion-gap finding"
+                    try:
+                        inv_id = _allocate_inventory_ledger_id(
+                            scratchpad, preferred_id=f"INV-{inv_n:03d}",
+                            owner_phase="promotion_gate",
+                            owning_artifact="findings_inventory.md", title=title,
+                        )
+                    except Exception:
+                        inv_id = f"INV-{inv_n:03d}"
+                    try:
+                        sev = _severity_name_from_text(cand.get("text", ""), {})
+                    except Exception:
+                        sev = "Medium"
+                    loc = cand.get("location") or "UNKNOWN"
+                    appended_lines.extend([
+                        f"### Finding [{inv_id}]: {title}",
+                        f"**Severity**: {sev}",
+                        f"**Location**: `{loc}`",
+                        "**Preferred Tag**: [CODE-TRACE]",
+                        f"**Source IDs**: PROMOGAP ({cand.get('shape','')} orphan "
+                        f"from {cand.get('source_file','')}; content-shaped "
+                        "promotion-completeness gap — mechanically harvested, "
+                        "verifier to confirm or refute)",
+                        "**Verdict**: NEEDS_VERIFICATION",
+                        f"**Root Cause**: {cand.get('reason', '')}",
+                        f"**Description**: {_strip_md(cand.get('desc') or cand.get('text', ''))[:1200]}",
+                        "**Impact**: Potential unpromoted finding recovered from "
+                        "a feeder artifact (verifier to confirm the concrete harm).",
+                        "",
+                    ])
+                    new_keys.append(cand["_promo_key"])
+                if appended_lines:
+                    header = (
+                        "\n\n## Promotion-Completeness Candidates (PROMOGAP)\n\n"
+                        "Mechanically-harvested finding-shaped content (checklist "
+                        "cells, summary-table rows, referent-less exclusion "
+                        "stubs, unpromoted feeder findings) that never received "
+                        "a report ID. Low-confidence by construction — the "
+                        "verify phase confirms or refutes each. Recall-safe: "
+                        "append-only.\n\n"
+                    )
+                    hdr = (
+                        "" if "Promotion-Completeness Candidates (PROMOGAP)" in inv_text
+                        else header
+                    )
+                    try:
+                        inv_path.write_text(
+                            _append_inventory_blocks(inv_text, hdr, appended_lines),
+                            encoding="utf-8",
+                        )
+                        result["emitted_to_inventory"] = len(new_keys)
+                        seen.update(new_keys)
+                        rlines = ["# Promotion Gate Receipt", ""]
+                        rlines += [f"PROMOGAP-KEY: {k}" for k in sorted(seen)]
+                        receipt_path.write_text(
+                            "\n".join(rlines) + "\n", encoding="utf-8"
+                        )
+                    except Exception as exc:
+                        log.warning(f"[promotion-gate] inventory append failed: {exc!r}")
+                    try:
+                        _write_finding_records_from_inventory(scratchpad)
+                    except Exception:
+                        pass
+
+    try:
+        _write_promotion_routing_md(scratchpad, all_body, appc_rows, appa_rows)
+        _write_promotion_appendix_staging(scratchpad, appc_rows, appa_rows)
+    except Exception as exc:
+        log.warning(f"[promotion-gate] ledger write failed: {exc!r}")
+
+    return result
 
 
 _REPORT_DEDUP_AGENT_ID_RE = re.compile(r"\b([CHMLI]-\d{1,3})\b")
