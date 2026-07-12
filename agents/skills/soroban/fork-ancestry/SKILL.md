@@ -94,13 +94,19 @@ Compile results into:
 
 ### 2d. Hardcoded Known-Issue Floor (Web Search Fallback)
 
-If Solodit AND Tavily BOTH fail, use this minimum catalog — check EACH applicable parent:
+If Solodit AND Tavily BOTH fail, use this minimum catalog — check EACH applicable parent.
 
-| Parent | Critical Known Issue | Root Cause | Search Keywords |
+This floor is keyed on the dependency's **TYPE** (generic mechanism), NOT on any
+specific protocol name — brand-keyed rows are prohibited (a floor row naming a
+specific protocol is the confirmed benchmark-contamination vector; see the HARD
+no-overfit rule). Classify the detected parent into a type below and check the
+generic hazard class.
+
+| Parent (generic type) | Critical Known Issue | Root Cause | Search Keywords |
 |--------|---------------------|------------|-----------------|
-| SoroSwap (Uniswap V2 model) | First-depositor share inflation (share = 0 for tiny initial deposit) | `deposit()` mints shares proportionally; tiny first deposit sets price, second depositor can lose funds | `soroswap first deposit share inflation liquidity` |
+| AMM / swap pool (constant-product model) | First-depositor share inflation (share = 0 for tiny initial deposit) | `deposit()` mints shares proportionally; tiny first deposit sets price, second depositor can lose funds | `amm swap pool first deposit share inflation liquidity` |
 | Lending / reserve-accrual parent | Reserve accrual desync: interest/accrual index not updated on every balance-mutating path | Interest index update not triggered on every operation path (deposit/borrow/repay/withdraw), causing tracked-balance divergence | `lending reserve accrual index desync interest` |
-| Phoenix DEX | Concentrated liquidity bin boundary precision loss at extreme price ranges | Fixed-point arithmetic at bin edges truncates, accumulating rounding errors over many swaps | `phoenix concentrated liquidity bin precision rounding` |
+| Concentrated-liquidity AMM | Concentrated liquidity bin boundary precision loss at extreme price ranges | Fixed-point arithmetic at bin edges truncates, accumulating rounding errors over many swaps | `concentrated liquidity bin precision rounding soroban` |
 | External price/data oracle parent | No staleness check enforcement at consumer level (consumer does not validate data age) | Oracle publishes fresh data; consuming contracts read without checking the source `last_update`/timestamp | `oracle staleness consumer check soroban` |
 | SAC token interface | `transfer_from` allowance bypass via contract-to-contract calls where `from == contract_address` | SAC allowance model differs from ERC-20: contract calling on its own behalf bypasses allowance check | `stellar asset contract transfer_from allowance bypass` |
 | soroban-sdk (early versions) | Storage key collision via `Symbol::new` with similar string prefixes | `Symbol::new` and `Symbol::short` have different encodings; key collision possible for certain strings | `soroban-sdk symbol storage key collision` |

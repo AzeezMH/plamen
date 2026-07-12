@@ -98,19 +98,26 @@ Compile results into:
 
 ### 2d. Hardcoded Known-Issue Floor (Web Search Fallback)
 
-If Solodit AND Tavily BOTH fail, use this minimum catalog - check EACH applicable parent:
+If Solodit AND Tavily BOTH fail, use this minimum catalog - check EACH applicable parent.
 
-| Parent | Critical Known Issue | Root Cause | Search Keywords |
+This floor is keyed on the parent's **TYPE** (generic mechanism), NOT on any
+specific protocol name — brand-keyed rows are prohibited (a floor row naming a
+specific protocol is the confirmed benchmark-contamination vector; see the HARD
+no-overfit rule). Classify the detected parent (from Section 1) into a type
+below and check the generic known-issue class; use at most one illustrative
+brand only in prose, never as the row key.
+
+| Parent Type | Critical Known Issue | Root Cause | Search Keywords |
 |--------|---------------------|------------|-----------------|
-| Marinade/StakePool | Validator list manipulation via stake deposit ordering | Stake account priority ordering bypass | `marinade validator stake deposit ordering` |
-| Orca/Whirlpool | Tick array boundary crossing precision loss | sqrt_price calculation at tick boundaries | `whirlpool tick boundary precision sqrt` |
-| Solend/Save | Obligation refresh staleness + liquidation racing | Reserve refresh not enforced before liquidation | `solend obligation refresh stale liquidation` |
-| marginfi | Bank balance desync via flash loan deposit/withdraw | Balance tracking diverges from actual token balance | `marginfi bank balance flash loan desync` |
-| Drift | Oracle staleness in liquidation + market close edge cases | Stale oracle enables unfair liquidation | `drift oracle stale liquidation perp` |
-| Perpetual DEX | Token balance manipulation via flash loans | Price oracle manipulation via concentrated liquidity positions | `mango markets exploit oracle manipulation` |
-| SPL Stake Pool | Validator list index manipulation + reward fee timing | Validator removal during reward distribution | `spl stake pool validator reward timing` |
+| Liquid staking pool (validator-list model) | Validator list manipulation via stake deposit ordering | Stake account priority ordering bypass | `liquid staking pool validator stake deposit ordering exploit` |
+| Concentrated-liquidity AMM (tick-array model) | Tick array boundary crossing precision loss | sqrt_price calculation at tick boundaries | `concentrated liquidity amm tick boundary precision sqrt` |
+| Lending market (obligation/reserve model) | Obligation refresh staleness + liquidation racing | Reserve refresh not enforced before liquidation | `lending market obligation refresh stale liquidation race` |
+| Lending market (pooled-bank model) | Bank balance desync via flash loan deposit/withdraw | Balance tracking diverges from actual token balance | `lending market bank balance flash loan desync exploit` |
+| Perpetuals/derivatives market (oracle-based liquidation) | Oracle staleness in liquidation + market close edge cases | Stale oracle enables unfair liquidation | `perpetuals market oracle stale liquidation exploit` |
+| Perpetuals/derivatives DEX (thin-liquidity oracle) | Token balance manipulation via flash loans | Price oracle manipulation via concentrated liquidity positions | `perpetual dex thin liquidity oracle manipulation exploit` |
+| Delegated stake pool (SPL-style) | Validator list index manipulation + reward fee timing | Validator removal during reward distribution | `delegated stake pool validator reward timing exploit` |
 | Anchor (framework) | Version-specific: v0.24 discriminator collision, v0.27 init_if_needed re-init | Account type confusion via shared discriminator prefix | `anchor discriminator collision init_if_needed` |
-| Meteora | DLMM bin price precision at extreme ranges + reward calculation | Bin boundary arithmetic overflow at extreme prices | `meteora dlmm bin price overflow precision` |
+| Dynamic-liquidity AMM (bin-based model) | Bin price precision at extreme ranges + reward calculation | Bin boundary arithmetic overflow at extreme prices | `bin-based amm price overflow precision extreme range` |
 
 ---
 

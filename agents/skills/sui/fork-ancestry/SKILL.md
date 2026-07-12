@@ -96,9 +96,16 @@ Compile results into:
 
 ### 2d. Hardcoded Known-Issue Floor (Web Search Fallback)
 
-If Solodit AND Tavily BOTH fail, use this minimum catalog -- check EACH applicable parent:
+If Solodit AND Tavily BOTH fail, use this minimum catalog -- check EACH applicable parent.
 
-| Parent | Critical Known Issue | Root Cause | Search Keywords |
+This floor is keyed on the parent's **TYPE** (generic mechanism), NOT on any
+specific protocol name — brand-keyed rows are prohibited (a floor row naming a
+specific protocol is the confirmed benchmark-contamination vector; see the HARD
+no-overfit rule). Classify the detected parent (from Section 1) into a type
+below and check the generic known-issue class; use at most one illustrative
+brand only in prose, never as the row key.
+
+| Parent Type | Critical Known Issue | Root Cause | Search Keywords |
 |--------|---------------------|------------|-----------------|
 | CLMM DEX | Tick boundary crossing precision loss + liquidity accounting desync | sqrt_price calculation at tick boundaries, Position NFT state vs pool liquidity mismatch | `clmm tick precision sqrt_price` |
 | Lending protocol (obligation-based) | Obligation refresh staleness + liquidation racing on shared objects | Reserve refresh not enforced before obligation health check, concurrent tx ordering | `lending obligation refresh stale liquidation shared object` |
@@ -106,8 +113,8 @@ If Solodit AND Tavily BOTH fail, use this minimum catalog -- check EACH applicab
 | Lending protocol (receipt-token) | Receipt token exchange rate manipulation via first depositor + borrow dynamics staleness | Empty market rounding in receipt token minting, stale interest rate applied across epochs | `lending receipt token exchange rate first deposit borrow dynamics` |
 | Orderbook DEX | Order matching priority manipulation + balance manager accounting edge cases | Self-trading for priority manipulation, dust amounts in partial fills | `orderbook order priority self-trade balance dust` |
 | CDP/stablecoin protocol | Reward distribution fairness + overflow at extreme collateral ratios | Discrete epoch distribution timing, arithmetic overflow in collateral ratio calculation | `cdp reward epoch collateral overflow` |
-| Sui System Staking | Validator list manipulation via stake deposit ordering + reward fee timing | Stake account priority ordering in validator selection, reward distribution during epoch boundary | `sui staking validator reward epoch boundary` |
-| Aftermath/AMM | LP share price manipulation via donation to pool + StakedSui exchange rate lag | Direct Coin transfer to pool object inflates share price, staking rewards not reflected immediately | `aftermath pool share price donation stakedSui` |
+| Liquid staking / validator protocol | Validator list manipulation via stake deposit ordering + reward fee timing | Stake account priority ordering in validator selection, reward distribution during epoch boundary | `sui staking validator reward epoch boundary` |
+| AMM / LP share pool | LP share price manipulation via donation to pool + liquid-staking-token exchange rate lag | Direct Coin transfer to pool object inflates share price, staking rewards not reflected immediately in the receipt token's exchange rate | `amm pool share price donation staking token exchange rate` |
 
 ---
 

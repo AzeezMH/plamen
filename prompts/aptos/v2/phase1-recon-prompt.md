@@ -168,17 +168,18 @@ Read ~/.claude/agents/skills/aptos/fork-ancestry/SKILL.md (if it exists) or appl
 
 ### Hardcoded Known-Issue Floor (Web Search Fallback)
 
-If web searches fail or are unavailable, use this minimum catalog -- check EACH applicable parent:
+If web searches fail or are unavailable, use this minimum catalog -- check EACH applicable dependency type.
 
-| Parent | Critical Known Issue | Root Cause | Search Keywords |
-|--------|---------------------|------------|-----------------|
-| Cetus | Bit shift overflow in liquidity math ($223M exploit, 2025) | Unchecked `<<` shift with value >= bit width causes overflow | `cetus bit shift overflow liquidity exploit` |
-| Thala | Stability pool reward calculation manipulation | Reward timing attack via strategic deposit/withdraw around distribution | `thala stability pool reward timing attack` |
-| AMM DEX | Curve calculation precision loss at extreme reserves | Integer division truncation in swap calculation at boundary values | `amm curve precision reserves swap calculation` |
-| Echelon/Aries (lending) | Oracle price staleness enabling unfair liquidation | Stale price feed used for health factor calculation | `aptos lending oracle stale liquidation health` |
-| Tortuga/Amnis (liquid staking) | Exchange rate manipulation via direct APT transfer | Unsolicited APT deposit inflates exchange rate | `aptos liquid staking exchange rate donation attack` |
-| Cellana (ve-token) | Voting power calculation error at epoch boundary | Checkpoint staleness during epoch transition | `ve_token voting power epoch boundary checkpoint` |
-| DEX yield farm | Reward per share overflow with small deposits | Large multiplier applied to tiny deposit amounts | `masterchef reward overflow small deposit` |
+This floor is keyed on the dependency's **TYPE** (generic mechanism), NOT on any specific protocol name -- brand-keyed rows are prohibited (a floor row naming a specific protocol is the confirmed benchmark-contamination vector; see the HARD no-overfit rule). Classify the detected parent into a type below and check the generic known-issue class; use at most one illustrative brand only in prose, never as the row key.
+
+| Dependency Type | Critical Known Issue | Root Cause | Search Keywords |
+|------------------|---------------------|------------|-----------------|
+| AMM / swap pool (incl. concentrated-liquidity) | Bit shift overflow in liquidity math (e.g. a concentrated-liquidity DEX's $223M-class exploit, 2025); curve calculation precision loss at extreme reserves | Unchecked `<<` shift with value >= bit width causes overflow; integer division truncation in swap calculation at boundary values | `amm bit shift overflow liquidity exploit` / `amm curve precision reserves swap calculation` |
+| Stability pool / CDP protocol | Stability pool reward calculation manipulation | Reward timing attack via strategic deposit/withdraw around distribution | `stability pool reward timing attack` |
+| Lending / money market | Oracle price staleness enabling unfair liquidation | Stale price feed used for health factor calculation | `aptos lending oracle stale liquidation health` |
+| Liquid staking / LST protocol | Exchange rate manipulation via direct native-token transfer | Unsolicited deposit inflates exchange rate | `aptos liquid staking exchange rate donation attack` |
+| Voting-escrow (ve-token) / gauge protocol | Voting power calculation error at epoch boundary | Checkpoint staleness during epoch transition | `ve_token voting power epoch boundary checkpoint` |
+| Yield farm / reward-per-share protocol | Reward per share overflow with small deposits | Large multiplier applied to tiny deposit amounts | `masterchef reward overflow small deposit` |
 | Aptos Framework | FA dispatchable hook reentrancy (2024 framework update) | Dispatchable function hooks can execute arbitrary code during FA operations | `aptos fungible_asset dispatchable hook reentrancy` |
 
 ### Divergence Focus Areas for Aptos Move (ordered by criticality)

@@ -100,17 +100,22 @@ For EACH fee-related computation in the StableSwap:
 - `withdraw_admin_fees`: computed as `balance - reserves` (Curve pattern) or via internal tracking?
 - `donate_admin_fees`: if present, can it be used to manipulate the exchange rate?
 
-## CHECK 5: Known Curve Vulnerability Patterns
+## CHECK 5: Known StableSwap-Family Footguns
 
-Verify the fork addresses these historically exploited Curve issues:
+StableSwap-invariant pools (the Newton-Raphson `D`/`y` design popularized by
+Curve and now forked across many chains/languages) share a set of
+historically exploited failure classes because they share the same
+underlying math and lifecycle. Verify the fork addresses each class against
+the canonical StableSwap invariant design, the same way you'd check
+conformance against a written standard (e.g. ERC-20):
 
-| Known Issue | Curve Fix/Mitigation | Fork Has It? | Finding? |
+| Known Issue Class | Canonical Mitigation | Fork Has It? | Finding? |
 |------------|---------------------|-------------|---------|
-| Read-only reentrancy via `get_virtual_price` | view function guard or no callback | Check |
-| `remove_liquidity` imbalance fee bypass | fee on deviation from balanced withdrawal | Check |
-| `ramp_a` manipulation (A change during active positions) | minimum ramp duration, maximum A change per ramp | Check |
-| Admin fee accumulation leading to exchange rate drift | periodic `withdraw_admin_fees` or auto-donation | Check |
-| First depositor inflation via direct token transfer | minimum liquidity lock or internal balance tracking | Check |
+| Read-only reentrancy via a virtual-price / share-price view during an unfinished external call | view function guard or no callback re-entry into the price view | Check |
+| Imbalanced-withdrawal fee bypass (`remove_liquidity`-style exits skipping the imbalance fee) | fee charged on deviation from a balanced withdrawal | Check |
+| Amplification-ramp manipulation (A changed while positions are open, to move the invariant's price curve) | minimum ramp duration, maximum A change per ramp | Check |
+| Admin/protocol fee accumulation causing exchange-rate drift between accounting and real reserves | periodic fee sweep or auto-donation reconciling accounting to reserves | Check |
+| First-depositor share inflation via direct token transfer before any deposit | minimum liquidity lock or internal (non-balance-derived) accounting | Check |
 
 ## Output
 - Maximum 8 findings [SSC-1] through [SSC-8]

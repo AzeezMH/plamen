@@ -84,20 +84,30 @@ Compile results into:
 - CHECK: Cannot determine without deeper analysis (flag for breadth agent)
 
 ### 2d. Hardcoded Known-Issue Floor (Web Search Fallback)
-If Solodit AND Tavily BOTH fail, use this minimum catalog -- check EACH applicable parent:
+If Solodit AND Tavily BOTH fail, use this minimum catalog -- check EACH applicable parent type:
 
-| Parent | Critical Known Issue | Root Cause | Search Keywords |
+This floor is keyed on the parent's **TYPE** (generic mechanism), NOT on any
+specific protocol name — brand-keyed rows are prohibited (a floor row naming a
+specific protocol is the confirmed benchmark-contamination vector; see the HARD
+no-overfit rule). Classify the detected parent into a type below and check the
+generic hazard class; use at most one illustrative brand only in prose, never
+as the row key.
+
+| Parent Type | Critical Known Issue | Root Cause | Search Keywords |
 |--------|---------------------|------------|-----------------|
-| Thala | Stability pool share manipulation on first deposit | Empty pool rounding in share calculation | `thala stability pool first deposit share` |
-| Liquidswap | LP token inflation via small initial liquidity | MINIMUM_LIQUIDITY equivalent missing or insufficient | `liquidswap lp token inflation first liquidity` |
+| Stableswap / stability pool (AMM) | Share manipulation on first deposit (e.g. Thala-class stability pools) | Empty-pool rounding in share calculation | `aptos move stableswap stability pool first deposit share manipulation` |
+| AMM / liquidity pool (constant-product, e.g. Liquidswap-class) | LP token inflation via small initial liquidity | Missing or insufficient MINIMUM_LIQUIDITY-equivalent floor | `aptos move lp token inflation first liquidity minimum` |
 | DEX yield farm (Aptos) | Reward rate manipulation via zero-amount deposit | Checkpoint timing + zero-amount triggers reward update | `masterchef aptos deposit zero reward` |
-| Amnis Finance | Exchange rate manipulation between stAPT and amAPT | Discrete update timing allows entry at stale rate | `amnis finance exchange rate staleness stAPT` |
+| Liquid staking token (LST) | Exchange-rate staleness between LST and underlying; reward-distribution timing arbitrage | Discrete update timing allows entry at a stale rate, or reward-distribution timing creates an extractable arbitrage window | `aptos liquid staking exchange rate staleness reward timing arbitrage` |
 | Aptos Framework Staking | Delegation pool unlock timing + commission rate change | Validator can change commission before pending unlock completes | `delegation pool commission unlock timing aptos` |
-| Echelon | Oracle price staleness in liquidation path | Stale price allows unfair liquidation or avoids valid liquidation | `echelon lending oracle staleness liquidation` |
-| Cellana Finance | Vote-escrowed token lock bypass via gauge interaction | ve token accounting inconsistency during gauge deposit/withdraw | `cellana ve token lock gauge bypass` |
-| Tortuga | Liquid staking share price manipulation via rewards timing | Reward distribution timing creates extractable arbitrage window | `tortuga liquid staking share price reward timing` |
+| Lending / money market | Oracle price staleness in liquidation path | Stale price allows unfair liquidation or avoids valid liquidation | `aptos lending oracle staleness liquidation` |
+| Vote-escrowed (ve) governance / gauge | Vote-escrowed token lock bypass via gauge interaction | ve token accounting inconsistency during gauge deposit/withdraw | `aptos ve token lock gauge bypass` |
 | Aptos Fungible Asset Framework | Ref capability leak via public friend function | MintRef/TransferRef/BurnRef exposed through insufficiently restricted public(friend) function | `fungible asset ref capability leak public friend` |
 | Aptos Token V2 | Object ownership transfer bypassing royalty enforcement | Token transfer via object::transfer bypasses marketplace royalty hooks | `aptos token v2 royalty bypass transfer` |
+
+**Note**: This floor lists generic hazard CLASSES by parent type only — minimum
+coverage, not exhaustive, and not a substitute for live Solodit/Tavily research
+(2a/2b).
 
 ## 3. Divergence Analysis
 

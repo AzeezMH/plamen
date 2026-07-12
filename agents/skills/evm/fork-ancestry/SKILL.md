@@ -80,20 +80,32 @@ Compile results into:
 - CHECK: Cannot determine without deeper analysis (flag for breadth agent)
 
 ### 2d. Hardcoded Known-Issue Floor (Web Search Fallback)
-If Solodit AND Tavily BOTH fail, use this minimum catalog -- check EACH applicable parent:
+If Solodit AND Tavily BOTH fail, use this minimum catalog -- check EACH applicable parent.
 
-| Parent | Critical Known Issue | Root Cause | Search Keywords |
-|--------|---------------------|------------|-----------------|
-| Synthetix/StakingRewards | Reward rate manipulation via notifyRewardAmount timing | Reward duration reset on notify | `staking reward notify duration` |
-| Compound/CToken | First-depositor exchange rate manipulation | Empty market rounding | `ctoken exchange rate first deposit` |
-| Aave/LendingPool | Flash loan + oracle manipulation for unfair liquidation | Spot price dependency | `aave flash liquidation oracle` |
-| Uniswap V2 | First LP inflation attack (MINIMUM_LIQUIDITY bypass) | LP share rounding at low liquidity | `uniswap v2 minimum liquidity first` |
-| Basis/Tomb/Boardroom | Epoch-boundary seigniorage front-running + stake timing | Discrete epoch distribution | `boardroom seigniorage epoch timing` |
-| Klondike/Tomb V2 | Epoch-boundary timing + treasury allocation fairness + role privilege scope | Extended seigniorage model with additional operator roles and cooldown mechanisms | `klondike tomb v2 seigniorage treasury operator` |
-| MasterChef V2 | Reward rate manipulation via deposit(0) + unfair early-user dilution | Checkpoint timing + zero-amount deposit triggers reward update | `masterchef deposit zero reward rate timing` |
-| Curve StableSwap | Reentrancy via raw ETH transfer in remove_liquidity + read-only reentrancy | ETH callback before state update, view function reads stale state | `curve reentrancy remove liquidity read-only` |
-| Balancer V2 Vault | Flash loan + price oracle manipulation via pool balance change | Spot price manipulation within single transaction | `balancer vault flash loan oracle manipulation` |
-| Yearn V2 Vault | Share price manipulation via strategy report timing + first depositor | Donation before first deposit inflates pricePerShare | `yearn vault share price first deposit strategy` |
+This floor is keyed on the parent's **TYPE** (generic mechanism), NOT on any
+specific protocol name — brand-keyed rows are prohibited (a floor row naming a
+specific protocol is the confirmed benchmark-contamination vector; see the HARD
+no-overfit rule). Classify the detected parent (from Section 1) into a type
+below and check the generic known-issue class; use at most one illustrative
+brand only in prose, never as the row key.
+
+| Parent Type | Critical Known-Issue Class | Root Cause | Search Keywords |
+|--------------|----------------------------|------------|-----------------|
+| Staking-rewards distributor | Reward-rate manipulation via reward-notification timing | Reward duration reset when a new reward is notified mid-period | `staking reward notify duration reset` |
+| Lending / money-market receipt token | First-depositor exchange-rate manipulation | Empty-market rounding in the exchange-rate calc | `lending exchange rate first deposit empty market` |
+| Lending / money-market liquidation engine | Flash loan + oracle manipulation for unfair liquidation | Spot-price dependency in the liquidation health check | `flash loan liquidation oracle manipulation` |
+| AMM constant-product pool (LP token) | First-LP inflation attack (minimum-liquidity bypass) | LP share rounding at low liquidity | `amm minimum liquidity first LP inflation` |
+| Epoch-based seigniorage / rebasing treasury | Epoch-boundary distribution front-running + stake timing | Discrete epoch distribution creates a race at the boundary | `epoch seigniorage boundary timing front-run` |
+| Epoch-based treasury with operator roles | Epoch-boundary timing + treasury allocation fairness + role privilege scope | Extended epoch model with additional operator roles and cooldown mechanisms | `epoch treasury operator role cooldown` |
+| Yield-farming reward distributor (checkpoint-based) | Reward-rate manipulation via zero-amount deposit + unfair early-user dilution | Checkpoint timing where a zero-amount deposit triggers a reward-rate update | `yield farming deposit zero reward rate checkpoint timing` |
+| Stableswap / invariant-curve AMM | Reentrancy via raw native-token transfer in liquidity removal + read-only reentrancy | Native-token callback fires before state update; view functions read stale state during the callback | `stableswap reentrancy remove liquidity read-only` |
+| AMM vault / batched-swap pool | Flash loan + price-oracle manipulation via pool-balance change | Spot price manipulated within a single transaction via balance change | `amm vault flash loan oracle manipulation balance` |
+| Yield vault (share-based accounting) | Share-price manipulation via strategy-report timing + first depositor | Donation before first deposit inflates price-per-share | `vault share price first deposit donation strategy` |
+
+**Note**: This floor lists generic known-issue CLASSES by parent type only — it
+is minimum coverage, not exhaustive, and NOT a substitute for the live-searched
+Solodit/Tavily results (2a/2b). Real research typically surfaces several more
+issues specific to the actual parent.
 
 ## 3. Divergence Analysis
 
