@@ -30,7 +30,7 @@ interrogated on THIS axis" spot. Your job is the missing interrogation.
 
 ---
 
-## The five axes (interrogate on the ASSIGNED axis only)
+## The six axes (interrogate on the ASSIGNED axis only)
 
 For a GAP cell `(function f, axis A)`, ask ONLY axis `A`'s question of `f`:
 
@@ -48,6 +48,10 @@ For a GAP cell `(function f, axis A)`, ask ONLY axis `A`'s question of `f`:
   whether staleness or a wrong source is reachable.
 - **boundary** — At 0 / 1 / MAX / empty / duplicate / type-edge inputs to `f`,
   does behavior diverge from the non-edge case in a harmful way?
+- **identity** — For a function that acts on (mutates the balance / allowance /
+  role / state of) a subject or actor DISTINCT from its authorizing caller, was
+  that divergence explicitly authorized — or can a caller act on another
+  party's behalf without their consent, or a delegate exceed its bound?
 
 The driver tells you, per row, exactly which `(f, A)` pairs to interrogate. Do
 NOT re-examine axes not handed to you — those are already covered.

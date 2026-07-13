@@ -1331,9 +1331,12 @@ def compute_invariant_assertion_candidates(scratchpad: Path) -> list:
 _MAX_HOT_FUNCTIONS = 40          # mirrors _MAX_ENUMGAP_PER_RUN; budget lands on core
 _CALLER_THRESHOLD = 2            # "hot" caller count floor (a fn ≥2 callers is core)
 
-# The five orthogonal risk axes (HOW-shaped question per function). Order is
-# stable so the matrix columns are deterministic.
-_AXES: tuple = ("theft", "liveness", "accounting", "provenance", "boundary")
+# The orthogonal risk axes (HOW-shaped question per function). Order is
+# stable so the matrix columns are deterministic. `identity` = CWE-863/CWE-441/
+# CWE-639-shaped authorization-subject coverage: was the caller<->subject
+# binding examined at this locus (not merely "is the caller permitted" but "is
+# the caller the SAME subject whose value/state/role is being mutated").
+_AXES: tuple = ("theft", "liveness", "accounting", "provenance", "boundary", "identity")
 
 # Per-language value-effect / mover regex reused to decide a function CAN move
 # value (⇒ theft axis is IN-scope, not N/A). Built from the existing _LANG specs
@@ -1364,8 +1367,31 @@ _TRACE_TO_MOVE = re.compile(r"\[\s*TRACE\s*:[^\]]*(?:transfer|mint|withdraw|burn
 _TRACE_TO_REVERT = re.compile(r"\[\s*TRACE\s*:[^\]]*(?:revert|lock|brick|freeze|abort)", re.IGNORECASE)
 _BOUNDARY_ZERO_ETC = re.compile(r"\[\s*BOUNDARY\s*:[^\]]*(?:=\s*0\b|=\s*1\b|MAX|min|empty)", re.IGNORECASE)
 _POST_TYPE_BAL_ACC = re.compile(r"(?im)^\s*\*{0,2}Postcondition\s*Types?\*{0,2}\s*:.*\b(?:BALANCE|ACCESS)\b")
+# ACCESS-only postcondition cue (identity axis primary signal). Narrower than
+# `_POST_TYPE_BAL_ACC` on purpose: a bare BALANCE postcondition next to an
+# unrelated [TRACE:] (e.g. a theft trace to a transfer) must NOT also count as
+# an examined identity axis -- ACCESS specifically denotes the "who can use
+# these [postconditions]" authorization dimension (finding-output-format.md).
+_POST_TYPE_ACCESS = re.compile(r"(?im)^\s*\*{0,2}Postcondition\s*Types?\*{0,2}\s*:.*\bACCESS\b")
 _MH_LIVENESS = re.compile(r"(?i)\b(?:liveness|permanently\s+revert|permanently\s+lock|denial[- ]of[- ]service|halt|brick|freeze|stuck)\b")
 _STALENESS_CUE = re.compile(r"(?i)\b(?:stale|staleness|freshness|oracle|price\s+feed|last\s*Updat|provenance|source\s+of)\b")
+# Generic authorization-subject prose cue (CWE-863/CWE-441/CWE-639 shape): the
+# finding's own words indicate the caller<->subject binding was interrogated —
+# an actor authorized for ONE identity acting "on behalf of" / against a
+# DIFFERENT owner/recipient without that subject's own authorization, or a
+# confused-deputy / impersonation framing. Ecosystem-neutral wording only — no
+# ecosystem source tokens (no `msg.sender`, `require_auth`, `&signer`, etc.)
+# appear in this regex; it matches the generic English shape of the claim,
+# regardless of which ecosystem's finding prose happens to use it.
+_IDENTITY_CUE = re.compile(
+    r"(?i)\bon\s+behalf\s+of\b"
+    r"|\bcaller\b[^.\n]{0,80}\b(?:owner|recipient)\b"
+    r"|\b(?:owner|recipient)\b[^.\n]{0,80}\bcaller\b"
+    r"|\bwithout\s+the\s+(?:owner|recipient)(?:'s)?\s+(?:authorization|consent|approval)\b"
+    r"|\bauthoriz\w*\b[^.\n]{0,80}\bacts?\s+on\s+(?:a\s+)?(?:different|another)\b"
+    r"|\bconfused\s+deputy\b"
+    r"|\bimperson\w*\b"
+)
 
 
 def _load_function_summary(scratchpad: Path) -> dict:
@@ -1547,6 +1573,17 @@ def _axis_examined_signals(block: str, axis: str) -> bool:
                     or (_STALENESS_CUE.search(b) and _TAG_TRACE.search(b)))
     if axis == "boundary":
         return bool(_TAG_BOUNDARY.search(b) and _BOUNDARY_ZERO_ETC.search(b))
+    if axis == "identity":
+        # CWE-863/CWE-441/CWE-639: was the caller<->subject authorization
+        # binding traced to a terminal outcome (a [TRACE:] locus anchored by a
+        # stated ACCESS postcondition -- the "who can use these" dimension),
+        # or does the finding's own prose concretely attest the
+        # subject-authority relationship via the generic authorization-subject
+        # cue anchored to a trace? Mirrors provenance's tag+cue shape; a bare
+        # BALANCE postcondition next to an unrelated TRACE (theft/liveness)
+        # must not also satisfy this axis.
+        return bool((_TAG_TRACE.search(b) and _POST_TYPE_ACCESS.search(b))
+                    or (_TAG_TRACE.search(b) and _IDENTITY_CUE.search(b)))
     return False
 
 
@@ -1582,6 +1619,11 @@ def _axis_examined_secondary(block: str, axis: str) -> bool:
         # A stated BALANCE/ACCESS postcondition type concretely addresses the
         # accounting axis (value/authorization relation examined at the locus).
         return bool(_POST_TYPE_BAL_ACC.search(b))
+    if axis == "identity":
+        # Tag-light ecosystems (Soroban/DAML) often attest the caller<->subject
+        # binding concretely in Description/Impact prose without stamping a
+        # bracketed [TRACE:] tag. The generic cue alone in prose is sufficient.
+        return bool(_IDENTITY_CUE.search(prose))
     return False
 
 
@@ -1594,6 +1636,16 @@ def _axis_na(hf: dict, axis: str) -> bool:
     if axis == "theft":
         # No value effect AND no state write ⇒ nothing to steal at this locus.
         return not (hf.get("value_effect") or hf.get("writes"))
+    if axis == "identity":
+        # No value effect, no state write, and no role-elevation signal ⇒ this
+        # locus has no value/state/role effect that could be misdirected onto a
+        # subject distinct from its authorizing caller — nothing for the
+        # authorization-subject axis to bind. "Distinct subject" itself is not
+        # cheaply derivable from abstract `hf` metadata without per-ecosystem
+        # parameter-shape parsing, so we degrade conservatively onto the same
+        # value/state/role-effect gate already proven safe for `theft`, rather
+        # than fabricate a source-token detector here.
+        return not (hf.get("value_effect") or hf.get("writes") or hf.get("elevate"))
     return False
 
 

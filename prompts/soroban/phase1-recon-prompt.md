@@ -614,7 +614,7 @@ Grep in contract .rs files (exclude target/, tests/, node_modules/, .stellar/):
 | `panic!\|panic_with_error!\|unwrap()` | PANIC_PATTERNS |
 | (2+ contract crates in Cargo workspace members within scope) | HAS_MULTI_CONTRACT |
 | CPI targets to known protocol contract addresses or named crates: `soroswap\|phoenix\|blend\|aquarius\|comet` (EXCLUDE: soroban-sdk, soroban-token-sdk, stellar-xdr — standard SDK crates) | NAMED_EXTERNAL_PROTOCOL |
-| `deposit_for\|stake_for\|delegate_to\|mint_for\|withdraw_for\|on_behalf_of` (public functions writing state for a caller-provided Address target) | MULTI_STEP_OPS |
+| `\w+_for\(\|\w+_for_\w+\(\|delegate_to\|on_behalf_of\|for_owner\|for_recipient\|operator\s*:\s*Address\|delegate\s*:\s*Address\|transfer_from\|burn_from\|approve\|allowance` (public functions writing state for a caller-provided Address target distinct from the caller — behalf-of suffix shape family (`deposit_for`/`stake_for`/`mint_for`/`withdraw_for`/`claim_for_user`/etc., not a fixed literal list) plus Address-typed operator/delegate params plus SEP-41 delegated-action methods; excludes purely internal helpers with no Address-subject parameter) | MULTI_STEP_OPS |
 | ANY `env.invoke_contract`/`try_invoke_contract` target or Cargo dependency whose implementation is NOT vendored in-repo (only a contract address / external crate dependency is known, no local source with a real function body), is NOT a recognized SDK crate (soroban-sdk, soroban-token-sdk, stellar-xdr), AND whose returned value is consumed (assigned, branched on, or used to move balances/state) | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
 
 **`EXTERNAL_DEPENDENCY` is a GENERIC, non-brand mechanical trigger** — the row

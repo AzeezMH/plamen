@@ -169,13 +169,16 @@ def test_axis_examined_from_closed_tags(tmp_path):
     _hot_graph(sp, root)
     # A finding at hotFn's locus carrying a TRACE-to-transfer (theft EXAMINED),
     # a VARIATION (accounting EXAMINED), an EXTERNAL-ASSUMPTION (provenance),
-    # a BOUNDARY:X=0 (boundary EXAMINED), and a TRACE-to-revert (liveness).
+    # a BOUNDARY:X=0 (boundary EXAMINED), a TRACE-to-revert (liveness), and a
+    # TRACE combined with a stated ACCESS postcondition + the generic
+    # authorization-subject cue (identity EXAMINED).
     _write_inv_finding(
         sp, "C.sol:L10",
         "**Description**: [TRACE:withdraw->transfer to attacker] "
         "[VARIATION:decimals 18->6] [EXTERNAL-ASSUMPTION: oracle fresh] "
-        "[BOUNDARY:X=0] [TRACE:amount=MAX->revert]\n"
-        "**Postcondition Types**: BALANCE\n")
+        "[BOUNDARY:X=0] [TRACE:amount=MAX->revert] "
+        "[TRACE:caller acts on behalf of the owner, confirmed bound]\n"
+        "**Postcondition Types**: BALANCE, ACCESS\n")
     gaps = eg.compute_axis_coverage_gaps(sp)
     gapped_axes = {g["axis"] for g in gaps}
     # every axis was examined by a closed tag -> zero gaps
@@ -187,6 +190,7 @@ def test_axis_examined_from_closed_tags(tmp_path):
     assert cells["provenance"] == "EXAMINED"
     assert cells["boundary"] == "EXAMINED"
     assert cells["liveness"] == "EXAMINED"
+    assert cells["identity"] == "EXAMINED"
 
 
 def test_ambiguous_cell_is_gap_not_examined(tmp_path):
@@ -255,6 +259,141 @@ def test_prose_liveness_examined_without_trace_tag(tmp_path):
     assert cells["liveness"] == "EXAMINED"
     # Floor preserved: an axis with neither tag nor prose cue is still GAP.
     assert "accounting" in gapped and "boundary" in gapped
+
+
+# ── identity axis (M2 6th axis: authorization-subject coverage) ─────────────
+
+def test_identity_gap_when_unbound_and_regression_other_axes_unchanged(tmp_path):
+    """(a) Identity GAP fixture + (e) regression fixture combined: a finding
+    whose prose describes an authorized caller acting on a distinct subject
+    with no bounding check -- using wording that names the *concept* but never
+    hits the concrete generic authorization-subject cue -- must default to a
+    GAP on identity (ambiguous ⇒ GAP, the recall-safe floor every other axis
+    already uses), while the other five axes stay EXACTLY as EXAMINED as they
+    were before the identity axis existed (byte-unchanged verdicts on the same
+    tag set proves the new axis is additive, not a perturbation)."""
+    eg = _eg()
+    root, sp = _proj(tmp_path)
+    _hot_graph(sp, root)
+    _write_inv_finding(
+        sp, "C.sol:L10",
+        "**Description**: [TRACE:withdraw->transfer to attacker] "
+        "[VARIATION:decimals 18->6] [EXTERNAL-ASSUMPTION: oracle fresh] "
+        "[BOUNDARY:X=0] [TRACE:amount=MAX->revert] "
+        "An authorized caller acts on a distinct subject with no bounding "
+        "check tying the two together.\n"
+        "**Postcondition Types**: BALANCE\n")
+    gaps = eg.compute_axis_coverage_gaps(sp)
+    gapped_axes = {g["axis"] for g in gaps}
+    # identity is the ONLY gap -- proves the mechanical cue does not fire on
+    # loose conceptual wording ("distinct subject") that never says "on behalf
+    # of" / "owner" / "recipient" / "without ... authorization".
+    assert gapped_axes == {"identity"}, gapped_axes
+    matrix = json.loads((sp / "_hot_function_axes.json").read_text(encoding="utf-8"))
+    cells = matrix["matrix"][0]["cells"]
+    # Regression: the five pre-existing axes are unchanged EXAMINED verdicts.
+    assert cells["theft"] == "EXAMINED"
+    assert cells["accounting"] == "EXAMINED"
+    assert cells["provenance"] == "EXAMINED"
+    assert cells["boundary"] == "EXAMINED"
+    assert cells["liveness"] == "EXAMINED"
+    assert cells["identity"] == "GAP"
+
+
+def test_identity_examined_via_prose_secondary_signal(tmp_path):
+    """(b) Identity EXAMINED fixture: prose that CONCRETELY confirms the
+    caller<->subject authorization bound was checked, with no bracketed
+    [TRACE:] tag at all, must count identity EXAMINED via the secondary
+    (tag-light-ecosystem) prose signal -- not a false GAP."""
+    eg = _eg()
+    root, sp = _proj(tmp_path)
+    _hot_graph(sp, root)
+    _write_inv_finding(
+        sp, "C.sol:L10",
+        "**Description**: The guard confirms the caller acts on behalf of "
+        "the owner only, so no third party can act without the owner's "
+        "authorization.\n"
+        "**Impact**: no impact -- the binding is enforced.\n")
+    gaps = eg.compute_axis_coverage_gaps(sp)
+    gapped = {g["axis"] for g in gaps}
+    assert "identity" not in gapped
+    matrix = json.loads((sp / "_hot_function_axes.json").read_text(encoding="utf-8"))
+    cells = matrix["matrix"][0]["cells"]
+    assert cells["identity"] == "EXAMINED"
+    # Floor preserved: axes with neither tag nor prose cue are still GAP.
+    assert "accounting" in gapped and "boundary" in gapped
+
+
+def test_identity_na_credit_only_recipient(tmp_path):
+    """(c) N/A negative control #1: a credit-only-recipient locus -- no
+    value effect, no state write, no role-elevation signal -- has nothing
+    that could be misdirected onto a distinct subject. N/A, not GAP."""
+    eg = _eg()
+    hf = {"function": "myOwnBalance", "loc": "C.sol:L1", "callers": 3,
+          "writes": False, "elevate": False, "value_effect": False, "lang": "sol"}
+    assert eg._axis_na(hf, "identity") is True
+
+
+def test_identity_na_single_actor_self_call(tmp_path):
+    """(c) N/A negative control #2: a single-actor self-call (a no-op ping
+    with no value/state/role effect) -- same abstract shape, different
+    narrative -- also N/A, not GAP."""
+    eg = _eg()
+    hf = {"function": "ping", "loc": "C.sol:L2", "callers": 2,
+          "writes": False, "elevate": False, "value_effect": False, "lang": "sol"}
+    assert eg._axis_na(hf, "identity") is True
+
+
+def test_identity_na_end_to_end_pipeline(tmp_path):
+    """(c) End-to-end confirmation: a genuinely hot-but-inert function (hot via
+    caller count only, no value effect / write / elevate) resolves to identity
+    N/A through the full compute_axis_coverage_gaps pipeline, and never
+    appears as an identity GAP row -- mirrors the existing pure-view theft N/A
+    pipeline test but for the new axis."""
+    eg = _eg()
+    root, sp = _proj(tmp_path)
+    graph = {
+        "source": "slither",
+        "var_refs": {},
+        "functions": {"C.viewFn": {"bare": "viewFn", "loc": "C.sol:L10",
+                                    "callers": ["a", "b"]}},
+    }
+    (sp / "_mechanical_graph.json").write_text(json.dumps(graph), encoding="utf-8")
+    _sol(root, "C.sol",
+         "contract C {\n"
+         "  function viewFn() external view returns (uint) { return 1; }\n"
+         "}\n")
+    eg.compute_axis_coverage_gaps(sp)
+    matrix = json.loads((sp / "_hot_function_axes.json").read_text(encoding="utf-8"))
+    row = next(r for r in matrix["matrix"] if r["function"] == "viewFn")
+    assert row["cells"]["identity"] == "N/A"
+    assert not any(g["function"] == "viewFn" and g["axis"] == "identity"
+                   for g in matrix["gaps"])
+
+
+def test_identity_cue_fires_on_cross_language_evm_worded_block(tmp_path):
+    """(d) Cross-language non-overfit fixture: a finding block written in
+    EVM terms (msg.sender vs from) must still trigger the identity cue --
+    proving the detector reads a GENERIC authorization-subject phrase shape
+    ("acts on behalf of ... owner"), not a Soroban-shaped vocabulary. The
+    cue never contains an EVM/Solana/Move source token itself; incidental
+    source-token mentions in the finding's OWN prose (msg.sender, from) must
+    not be required for, nor block, the match."""
+    eg = _eg()
+    root, sp = _proj(tmp_path)
+    _hot_graph(sp, root)
+    _write_inv_finding(
+        sp, "C.sol:L10",
+        "**Description**: The function loosely compares msg.sender against "
+        "the from address; a caller can invoke transferFrom acting on "
+        "behalf of a different owner without an allowance check, since the "
+        "caller never proves ownership over the from address.\n")
+    gaps = eg.compute_axis_coverage_gaps(sp)
+    gapped = {g["axis"] for g in gaps}
+    assert "identity" not in gapped
+    matrix = json.loads((sp / "_hot_function_axes.json").read_text(encoding="utf-8"))
+    cells = matrix["matrix"][0]["cells"]
+    assert cells["identity"] == "EXAMINED"
 
 
 # ── skip-when-clean ──────────────────────────────────────────────────────────
