@@ -18312,15 +18312,47 @@ def _validate_report_coverage_semantic_contract(scratchpad: Path) -> list[str]:
                 )
 
         combined = f"{status} {reason}".upper()
+        # Fix A — structured mode-limit detection (NOT a prose substring scan
+        # over merged status+reason, which is the negation-blind fragility class
+        # docs/design/regex-fragility-remediation-plan.md forbids). A genuine
+        # Thorough mode-limit is a DEFERRED disposition whose QUALIFIER is the
+        # canonical `mode-limited` token, in one of the two renderings phase6
+        # HARD RULE 3/6 mandates: the status column is `DEFERRED: mode-limited`
+        # (merged), OR the reason column LEADS with `mode-limited:` (split). An
+        # honest `DEFERRED` whose reason LEADS with UNRESOLVED_EVIDENCE /
+        # NEEDS_VERIFICATION and only mentions `mode-limited` inside a negation
+        # ("Not `mode-limited`", carried for human review) is NOT a mode-limit —
+        # mode-limited is not its disposition qualifier — so it is excluded
+        # structurally, with no negation-lookahead. (`status` is already
+        # uppercased above; the reason lead is normalized the same way. Keying on
+        # the qualifier POSITION is what distinguishes the two, since the real
+        # false-positive row carries a bare `DEFERRED` status with the honest
+        # disposition token living in its reason column.)
+        lead_disposition = re.split(r"[:\s]", status.strip().strip("`*_ "), 1)[0].upper()
+        reason_lead = re.split(r"[:\s]", reason.strip().strip("`*_ "), 1)[0].upper()
+        row_mode_limited = bool(
+            re.search(r"\bMODE[-_ ]?LIMITED\b", status)
+        ) or reason_lead in {"MODE-LIMITED", "MODE_LIMITED", "MODELIMITED"}
         if (
             mode == "thorough"
             and sev in {"Critical", "High", "Medium"}
-            and "DEFERRED" in combined
-            and re.search(r"\bmode[-_ ]?limited|lane\s+did\s+not\s+run|not\s+run\s+in\s+mode\b", combined, re.IGNORECASE)
+            and lead_disposition == "DEFERRED"
+            and row_mode_limited
         ):
-            issues.append(
-                "report_coverage semantic contract: Thorough mode cannot "
-                f"mode-limit/defer Medium+ candidate {raw_id or '(unknown)'}"
+            # Fix B — haltless parity. A genuine Thorough mode-limit is a fact
+            # about what actually ran; retrying the LLM cannot repair it, so a
+            # hard-halt just burns retries and blocks a substantively-complete
+            # audit (contradicting the CLAUDE.md repair-then-degrade contract).
+            # Degrade to a flagged human-review row instead. Append
+            # UNCONDITIONALLY (mirroring the obligation-ledger retention below) —
+            # NOT via the facet-gated risk_rows block, because a mode-limited
+            # lane has no extracted facets and a fallthrough there would drop it
+            # silently.
+            risk_rows.append(
+                f"| {raw_id or '(unknown)'} | {sev} | THOROUGH-MODE-LIMITED | "
+                f"{reason.replace('|', '/') or '(missing reason)'} | "
+                "mode-limited deferral in Thorough mode "
+                "(flagged for human review, not halted) |"
             )
             continue
 
@@ -18389,9 +18421,13 @@ def _validate_report_coverage_semantic_contract(scratchpad: Path) -> list[str]:
         except Exception:
             pass
 
-    # Obligation issues are intentionally excluded from the returned hard-fail
-    # `issues` list (degrade-not-halt). `issues` here only carries the
-    # low-ambiguity Thorough mode-limited Medium+ contract violation.
+    # This contract is now fully haltless (repair-then-degrade, per CLAUDE.md):
+    # both retention classes it detects — Thorough mode-limited Medium+ deferrals
+    # (Fix B, above) and unaccounted obligations — are written to
+    # report_semantic_retention_risks.md as flagged human-review rows, never
+    # added to the returned hard-fail `issues` list. `issues` therefore stays
+    # empty; it is retained as the return type for the report_index driver gate,
+    # which now finds no blocking coverage issue from this check and proceeds.
     return issues[:10]
 
 

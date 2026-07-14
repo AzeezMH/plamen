@@ -59,7 +59,12 @@ def test_candidate_semantic_facets_extract_general_mechanisms(tmp_path: Path):
     assert "unauthenticated-source" in facets["branch_conditions"]
 
 
-def test_thorough_mode_blocks_medium_mode_limited_deferred(tmp_path: Path):
+def test_thorough_mode_mode_limited_deferred_degrades_not_halts(tmp_path: Path):
+    # Fix B (haltless parity): a GENUINE Thorough mode-limit — a DEFERRED
+    # disposition whose reason LEADS with the canonical `mode-limited` qualifier
+    # — no longer hard-halts. It degrades to a flagged human-review row in
+    # report_semantic_retention_risks.md. `issues` stays empty (haltless); the
+    # candidate is still surfaced, not dropped.
     validators = _load("plamen_validators")
     (tmp_path / "config.json").write_text(
         json.dumps({"mode": "thorough"}) + "\n",
@@ -76,8 +81,46 @@ def test_thorough_mode_blocks_medium_mode_limited_deferred(tmp_path: Path):
 
     issues = validators._validate_report_coverage_semantic_contract(tmp_path)
 
-    assert issues
-    assert "Thorough mode cannot" in issues[0]
+    assert issues == []  # haltless: a real mode-limit degrades, never halts
+    risk = tmp_path / "report_semantic_retention_risks.md"
+    assert risk.exists()
+    body = risk.read_text(encoding="utf-8")
+    assert "THOROUGH-MODE-LIMITED" in body and "H-7" in body  # flagged, not dropped
+
+
+def test_thorough_mode_honest_unresolved_deferral_is_not_mode_limit(tmp_path: Path):
+    # Regression lock for the Spectra false-positive HALT. Reproduces
+    # report_coverage.md row 91 exactly: the Status column is a bare `DEFERRED`,
+    # the disposition token `UNRESOLVED_EVIDENCE` / `NEEDS_VERIFICATION` LEADS the
+    # reason column, and `mode-limited` appears only inside a NEGATION
+    # ("Not `mode-limited`"). This is an honest could-not-verify deferral carried
+    # for human review — NOT a mode-limit — so it must neither halt
+    # (`issues == []`) nor be mis-flagged as a THOROUGH-MODE-LIMITED retention
+    # risk. Before the fix, a negation-blind substring regex matched
+    # `MODE-LIMITED` inside "NOT `mode-limited`" and hard-halted the run.
+    validators = _load("plamen_validators")
+    (tmp_path / "config.json").write_text(
+        json.dumps({"mode": "thorough"}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "report_coverage.md").write_text(
+        "# Report Coverage Audit\n\n"
+        "## Raw Candidate Ledger\n"
+        "| Source File | Candidate ID / Label | Severity Signal | Status | Report ID / Refutation / Reason |\n"
+        "|-------------|----------------------|-----------------|--------|---------------------------------|\n"
+        "| report_index_coverage_seed.md | INV-245 | Medium | DEFERRED | "
+        "UNRESOLVED_EVIDENCE — NEEDS_VERIFICATION; unmapped, no verify file, no "
+        "facets in bounded ledgers. Not `mode-limited` (Thorough ran full "
+        "pipeline) — genuinely unresolved candidates carried for human review. |\n",
+        encoding="utf-8",
+    )
+
+    issues = validators._validate_report_coverage_semantic_contract(tmp_path)
+
+    assert issues == []  # was a FALSE-POSITIVE HALT before the fix
+    risk = tmp_path / "report_semantic_retention_risks.md"
+    body = risk.read_text(encoding="utf-8") if risk.exists() else ""
+    assert "THOROUGH-MODE-LIMITED" not in body  # honest deferral is not a mode-limit
 
 
 def test_core_mode_allows_mode_limited_deferred_accounting(tmp_path: Path):

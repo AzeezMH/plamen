@@ -753,7 +753,24 @@ def print_failure_diagnosis(phase_name: str, scratchpad: str,
                 "diagnosis skipped because user requested stop"
             )
         else:
-            timeout_s = 60 if backend == "codex" else 30
+            # Advisory-diagnosis subprocess budget for a COLD `claude -p` /
+            # `codex exec` spawn. 30s (Claude) / 60s (Codex) was too tight — a
+            # cold LLM start routinely exceeded it, so almost every failure
+            # diagnosis fell back to the deterministic local one instead of the
+            # richer LLM explanation. Bumped, and made env-overridable
+            # (PLAMEN_DIAGNOSIS_TIMEOUT_CEILING_S) mirroring the other timeout
+            # ceilings. Purely advisory: this subprocess's result never affects
+            # the halt/degrade decision, and a timeout still yields a safe
+            # _local_diagnosis fallback — so raising it carries zero correctness
+            # risk, only diagnosis-quality upside.
+            _default_diag_timeout = 150 if backend == "codex" else 90
+            try:
+                timeout_s = max(1, int(float(os.environ.get(
+                    "PLAMEN_DIAGNOSIS_TIMEOUT_CEILING_S",
+                    str(_default_diag_timeout),
+                ))))
+            except Exception:
+                timeout_s = _default_diag_timeout
             deadline = time.time() + timeout_s
             proc = None
             with diagnosis_prompt_path.open("rb") as stdin_file:
