@@ -146,6 +146,7 @@ def _call_offline_scanner(binary: str, lockfile: Path) -> str:
     try:
         proc = subprocess.run(
             cmd, cwd=str(lockfile.parent), capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=120, shell=False,
         )
         return (proc.stdout or "") + "\n" + (proc.stderr or "")

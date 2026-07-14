@@ -737,7 +737,7 @@ Grep in .move source files (exclude build/, tests/ directories):
 | `friend ` | FRIEND_DECLARATION |
 | `#\[allow(unused\|lint_allow` | SUPPRESSED_WARNING |
 | `ecdsa_k1::secp256k1_verify\|ed25519::ed25519_verify\|ecdsa_r1\|hash::blake2b256\|hmac::hmac_sha3_256` | HAS_SIGNATURES |
-| `approve\|delegate\|allowance\|deposit_for\|stake_for\|delegate_to\|_on_behalf\|_for_user` (public/entry functions with target address parameter writing state for that target) | MULTI_STEP_OPS |
+| `\w+_for\(\|\w+_for_\w+\(\|delegate_to\|_on_behalf\|on_behalf_of\|for_owner\|for_recipient\|operator\s*:\s*address\|delegate\s*:\s*address\|approve\|allowance\|transfer_from` (public/entry functions writing state for a caller-provided address target distinct from the sender — behalf-of suffix-family shape, e.g. `deposit_for`/`stake_for`/`delegate_to`/`mint_for`/`withdraw_for`, not a fixed literal list, plus address-typed operator/delegate params plus delegated-action methods (approve/allowance/transfer_from); excludes purely internal helpers with no address-subject parameter) | MULTI_STEP_OPS |
 | External package calls to named protocols in Move.toml deps or use statements: `cetus\|deepbook\|suilend\|navi\|scallop\|turbos\|aftermath\|bucket\|kriya\|flowx\|kai_finance\|haedal\|pyth\|wormhole\|sui_bridge` (EXCLUDE: sui::, sui_framework::, std:: — standard framework modules) | NAMED_EXTERNAL_PROTOCOL |
 | ANY external package call whose implementation is NOT vendored in-repo (only a `Move.toml` dependency or an address-qualified `use` is known), is NOT a recognized framework module (sui::, sui_framework::, std::), AND whose returned object/value is consumed | EXTERNAL_DEPENDENCY (alias: also sets NAMED_EXTERNAL_PROTOCOL for back-compat) |
 

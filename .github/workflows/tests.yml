@@ -1,0 +1,68 @@
+name: tests
+
+# Cross-OS CI companion to scripts/test_cross_os_hygiene.py: that test is a
+# STATIC gate (no code actually executes on another OS), this workflow is
+# the DYNAMIC complement — it runs the real scripts/ pytest suite on
+# Linux, Windows, and macOS so behavioral cross-OS regressions (not just
+# the syntactic anti-patterns the static gate catches) surface in CI
+# instead of being caught manually after the fact.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      # Matches the python-version used elsewhere in this repo's CI
+      # (.github/workflows/install-smoke.yml) and the interpreter this
+      # gate was authored/verified against.
+      PYTHON_VERSION: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        # Detect a requirements/pyproject file rather than assuming one
+        # exists; skip cleanly if neither is present.
+        shell: bash
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          if [ -f requirements.txt ]; then
+            echo "Installing from requirements.txt"
+            python -m pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            echo "Installing from pyproject.toml"
+            python -m pip install .
+          else
+            echo "No requirements.txt or pyproject.toml found - skipping dependency install"
+          fi
+
+      - name: Run scripts/ test suite
+        # scripts/ contains ~285 test_*.py modules covering the audit
+        # pipeline's mechanical substrate (thousands of individual test
+        # cases) - this is a large suite and can take several minutes per
+        # OS. That is intentional: this workflow exists specifically to
+        # catch Windows-only (and macOS-only) behavioral breakage before
+        # it reaches main, so full-suite correctness is prioritized over
+        # CI wall-clock time.
+        shell: bash
+        run: |
+          cd scripts && python -m pytest . -q

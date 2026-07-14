@@ -217,6 +217,37 @@ def test_load_summary_header_driven_scip_shape(tmp_path):
     assert summ.get("bar", {}).get("callers") == 5
 
 
+def test_load_summary_hash_prefixed_header_reads_callers_not_callees(tmp_path):
+    eg = _eg()
+    _root, sp = _proj(tmp_path)
+    # Some recon writers emit `#Callers` / `#Callees` (leading `#`). The bare
+    # `== "callers"` compare misses this, falls back to legacy cells[4], and in
+    # this schema cells[4] is `#Callees` (3) -- silently reading callee count as
+    # caller count. The header-label match must strip the leading `#` and find
+    # the REAL Callers column (7), not the Callees column (3).
+    (sp / "function_summary.md").write_text(
+        "| Function | Contract | Visibility | #Callers | #Callees |\n"
+        "|---|---|---|---|---|\n"
+        "| `qux` | C | external | 7 | 3 |\n",
+        encoding="utf-8")
+    summ = eg._load_function_summary(sp)
+    assert summ.get("qux", {}).get("callers") == 7
+
+
+def test_load_summary_plain_callers_header_still_works(tmp_path):
+    eg = _eg()
+    _root, sp = _proj(tmp_path)
+    # Plain (non-hash-prefixed) `Callers` / `Callees` header must still resolve
+    # correctly after the leading-`#` normalization is added.
+    (sp / "function_summary.md").write_text(
+        "| Function | Contract | Callers | Callees |\n"
+        "|---|---|---|---|\n"
+        "| `plain` | C | 9 | 1 |\n",
+        encoding="utf-8")
+    summ = eg._load_function_summary(sp)
+    assert summ.get("plain", {}).get("callers") == 9
+
+
 def test_load_summary_falls_back_to_index4_when_no_callers_label(tmp_path):
     eg = _eg()
     _root, sp = _proj(tmp_path)

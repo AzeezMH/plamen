@@ -179,9 +179,11 @@ def test_row_still_states_address_subject_applicability_qualifier():
     ), "the row's applicability qualifier regressed or was reworded"
 
 
-def test_evm_row_untouched():
-    # Trigger owner scope guard: the EVM MULTI_STEP_OPS row is a separate,
-    # already-existing per-language row and must not be touched by this change.
+def test_evm_row_ported_to_suffix_family():
+    # The EVM MULTI_STEP_OPS row was intentionally generalized (this session)
+    # from brittle enumerated literals (depositFor|stakeFor|...) to a suffix-
+    # family shape, mirroring the Soroban port, so a differently-named on-behalf
+    # function (e.g. executeFor) no longer evades the authz-subject trigger.
     evm_prompt = (
         Path(__file__).resolve().parent.parent
         / "prompts"
@@ -189,10 +191,12 @@ def test_evm_row_untouched():
         / "phase1-recon-prompt.md"
     )
     text = evm_prompt.read_text(encoding="utf-8")
-    assert (
-        "depositFor\\(\\|stakeFor\\(\\|delegateTo\\(\\|mintFor\\(\\|withdrawFor\\("
-        in text
-    ), "EVM MULTI_STEP_OPS row was modified - it is out of scope for this change"
+    assert "MULTI_STEP_OPS" in text, "EVM MULTI_STEP_OPS row must still exist"
+    # suffix-family generalization present (the whole point of the port):
+    assert r"\w+For\(" in text, (
+        "EVM MULTI_STEP_OPS row should carry the generic suffix-family shape "
+        r"(\w+For\() after the port, not only brittle enumerated literals"
+    )
 
 
 def test_part0_no_overfit_vocabulary_in_soroban_recon_prompt():

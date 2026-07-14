@@ -1473,7 +1473,7 @@ def _load_function_summary(scratchpad: Path) -> dict:
         # Header row: locate the "Callers" column by label, then skip the row.
         if "Function" in ln:
             for i, c in enumerate(cells):
-                if c.strip("` ").strip().lower() == "callers":
+                if c.strip("`# ").strip().lower() == "callers":
                     callers_idx = i
                     break
             continue

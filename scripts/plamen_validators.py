@@ -3194,7 +3194,7 @@ def _verify_override_retry_path(scratchpad: Path, phase_name: str) -> Path:
 def _verify_override_exhausted(scratchpad: Path, phase_name: str) -> bool:
     try:
         return int(
-            _verify_override_retry_path(scratchpad, phase_name).read_text()
+            _verify_override_retry_path(scratchpad, phase_name).read_text(encoding="utf-8")
         ) >= _VERIFY_OVERRIDE_RETRY_CAP
     except Exception:
         return False
@@ -3203,7 +3203,7 @@ def _verify_override_exhausted(scratchpad: Path, phase_name: str) -> bool:
 def _bump_verify_override(scratchpad: Path, phase_name: str) -> None:
     p = _verify_override_retry_path(scratchpad, phase_name)
     try:
-        n = int(p.read_text())
+        n = int(p.read_text(encoding="utf-8"))
     except Exception:
         n = 0
     try:

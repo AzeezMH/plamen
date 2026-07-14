@@ -2539,7 +2539,7 @@ def _body_content_retry_exhausted(scratchpad: Path, phase_name: str) -> bool:
     body-writer phase is spent, so content shortfall stops triggering retries
     and the phase WARN-ships its current (best-effort) sections."""
     try:
-        return int(_body_content_retry_path(scratchpad, phase_name).read_text()) >= _BODY_CONTENT_RETRY_CAP
+        return int(_body_content_retry_path(scratchpad, phase_name).read_text(encoding="utf-8")) >= _BODY_CONTENT_RETRY_CAP
     except Exception:
         return False
 
@@ -2547,7 +2547,7 @@ def _body_content_retry_exhausted(scratchpad: Path, phase_name: str) -> bool:
 def _bump_body_content_retry(scratchpad: Path, phase_name: str) -> None:
     p = _body_content_retry_path(scratchpad, phase_name)
     try:
-        n = int(p.read_text())
+        n = int(p.read_text(encoding="utf-8"))
     except Exception:
         n = 0
     try:
