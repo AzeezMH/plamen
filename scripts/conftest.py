@@ -18,10 +18,22 @@ Two responsibilities, both zero-risk to test *logic*:
    fully-mocked tests stay in the default (fast) lane.
 """
 
+import os
 import sys
 from pathlib import Path
 
 import pytest
+
+# (0) Hang-proof self-runs — make ANY `pytest` of this suite non-blocking without
+# an exported env var. The driver's halt/purge prompts (wait_halt_choice /
+# wait_critical_halt_choice / wait_purge_choice) exit on a non-TTY stdin, but an
+# agent/pty shell reports isatty()==True, so integration tests (test_driver_smoke,
+# test_halt_ux_e2e, test_signal_and_ratelimit) would block on a keypress there.
+# setdefault: only fills it if the caller/CI hasn't chosen a value, so explicit
+# overrides still win. Test-scoped — real audit runs never import conftest, so
+# this cannot change production halt behavior. This is what lets the agent run
+# the full suite unattended (the way it has for months) without it hanging.
+os.environ.setdefault("PLAMEN_AUTO_HALT_CHOICE", "exit")
 
 # (1) sys.path net — idempotent; scripts/ dir is this file's parent.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
