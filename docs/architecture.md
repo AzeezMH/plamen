@@ -210,6 +210,10 @@ delete a finding outright. The full per-function inventory (name, file:line,
 consumes/produces, purpose) lives in
 [internals.md § Mechanical Derivers](internals.md#mechanical-derivers).
 
+For the canonical name, aliases, and one-line meaning of every gate/mechanism
+mnemonic used above (G1, G2, Gate V, Gate P, M1, M2, AD-1…AD-6, M4, etc.), see
+[glossary.md § Mechanical recall gates, mechanisms & axes](glossary.md#mechanical-recall-gates-mechanisms--axes).
+
 ### Where the recall increase comes from (generic examples)
 
 The recall gain is precisely this: an attention-gap the LLM was *instructed* to

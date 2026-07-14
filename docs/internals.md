@@ -219,6 +219,26 @@ When a Claude PTY session's transcript shows an auto-compaction event, the drive
 
 > Deterministic Python functions — no LLM call — that generate, gate, promote, or reconcile findings directly against scratchpad artifacts and the mechanical reference graph. None of them assert a body-severity finding directly: every emitted candidate is a low-confidence `NEEDS_VERIFICATION` block that still passes through the normal chain/verify/report pipeline and the material-harm body floor. Source files: `scripts/enumeration_gate.py`, `scripts/plamen_mechanical.py`, `scripts/mechanical_verify.py`, `scripts/recon_prepass.py`, `scripts/plamen_contracts.py`, `scripts/plamen_markdown.py`.
 
+### Source-ID candidate tags
+
+The recall-generator functions below stamp a literal token into a candidate's `**Source IDs**:` line in `findings_inventory.md` (or, for two tags, into an internal receipt key only — never the markdown line itself). This table is the single place that tag is defined; see [glossary.md § Mechanical recall gates](glossary.md#mechanical-recall-gates-mechanisms--axes) for the plain-language description of the G1/G2/Gate V/Gate P/Mechanism-1/Mechanism-2 mechanisms these tags belong to.
+
+| Tag | Meaning | Emitted by (function) | Code-parsed? |
+|-----|---------|------------------------|---------------|
+| `ENUMGAP` | G1/G2 co-reference coverage-gap candidate; also the default stamp actually written for the critical-asset-mover, array-uniqueness, and unbounded-input derivers below (they share the same emitter and never override the tag) | `validate_enumeration_coverage` (`enumeration_gate.py:282`) via the shared emitter `_emit_candidates` (`enumeration_gate.py:572`) | **Yes** |
+| `ASSETMOVE` | Receipt/dedup key prefix only for the critical-asset-mover deriver — never written to a finding's `Source IDs` line (that line reads `ENUMGAP`, above) | `compute_critical_asset_mover_candidates` (`enumeration_gate.py:664`) | No |
+| `ARRUNIQ` | Receipt/dedup key prefix only for the array-uniqueness deriver — same `ENUMGAP` caveat as `ASSETMOVE` | `compute_array_uniqueness_candidates` (`enumeration_gate.py:768`) | No |
+| `UNBOUND` | Receipt/dedup key prefix only for the unbounded-input deriver — same `ENUMGAP` caveat | `compute_unbounded_input_candidates` (`enumeration_gate.py:835`) | No |
+| `VARGAP-B` | Receipt-key prefix only for Gate V axis 2 (boundary-input coverage) — the text actually stamped into `Source IDs` is the plain `VARGAP` row below | `compute_boundary_input_candidates` (`enumeration_gate.py:994`) | No |
+| `VARGAP-S` | Receipt-key prefix only for Gate V axis 3 (symmetric-operation coverage) — same `VARGAP` caveat | `compute_symmetric_operation_candidates` (`enumeration_gate.py:1100`) | No |
+| `VARGAP` | The literal tag both Gate V axis derivers above actually stamp into a finding's `Source IDs` line | `compute_variant_gaps` (`enumeration_gate.py:1177`) | No — referenced only in a driver log line, not regex-matched |
+| `PROMOGAP` | Gate P promotion-completeness candidate: harvested finding-shaped content routed to body/Appendix C/Appendix A as a fresh `NEEDS_VERIFICATION` block | `route_promotion_orphans` (`plamen_mechanical.py:5052`) | **Yes** |
+| `INVARIANT:CI-n` | Mechanism 1 committed-invariant assertion candidate — always suffixed with the specific `CI-n` id, never bare `INVARIANT` | `compute_invariant_assertion_candidates` (`enumeration_gate.py:1266`) | **Yes** |
+| `AXISGAP:<worker-finding-id>` | Mechanism 2 axis-coverage-gap candidate — always suffixed with the axis worker's own finding id | `compute_axis_coverage_gaps` / `promote_axis_findings_to_inventory` (`enumeration_gate.py:1772` / `:1907`) | **Yes** |
+| `NEXP-n` | Raw finding-ID prefix from the Phase 4b.7 depth-exploration worker, promoted verbatim as the `Source IDs` value; matched by the same chain-enabler regex as `ENUMGAP` | `promote_enumgap_exploration_to_inventory` (`enumeration_gate.py:2068`) | **Yes** |
+
+Every tag marked **Yes** above is matched by a downstream parser or gate (chain-enabler detection, the mechanism-attribution ledger, or the receipt/promotion machinery itself), so these literal strings are an internal contract — do not rename any of them without a coordinated code-and-test change (this file is documentation only).
+
 ### Recall-generators
 
 Read the mechanical reference graph (bake output, below) plus the finding inventory and emit low-confidence candidates for gaps a purely LLM-driven pass tends to miss: unexamined co-referencing functions, unaddressed boundary values, unpaired symmetric operations, un-asserted local invariants, and (via the axis-coverage meta-pass) risk-axes never examined against the codebase's mechanically-ranked hot functions.

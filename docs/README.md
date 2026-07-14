@@ -9,7 +9,7 @@ topic. The project [README](../README.md) and the AI-assistant install guide
 | Doc | What it covers |
 |-----|----------------|
 | [getting-started.md](getting-started.md) | What install did, what you actually need, running your first audit, where your report lands |
-| [glossary.md](glossary.md) | Plamen-specific terminology (pipeline, workers, PTY, haltless, scratchpad, evidence tags, …) |
+| [glossary.md](glossary.md) | Plamen-specific terminology (pipeline, workers, PTY, haltless, scratchpad, evidence tags, …), plus a legend for the mechanical recall gates/mechanisms/axes mnemonics (G1, G2, Gate V, Gate P, M1, M2, AD-1…AD-6, …) |
 
 ## Setup & maintenance
 
