@@ -379,6 +379,8 @@ def run_forge_test(
             cwd=str(project),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout_s,
             shell=False,
         )
