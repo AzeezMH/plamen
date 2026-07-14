@@ -1,8 +1,72 @@
+"""Shared pytest configuration for the Plamen scripts/ test suite.
+
+Two responsibilities, both zero-risk to test *logic*:
+
+1. ``sys.path`` net — put ``scripts/`` on ``sys.path`` so new test modules can
+   ``import enumeration_gate`` etc. without repeating the
+   ``sys.path.insert(0, ...)`` boilerplate that 190+ existing files hand-roll.
+   Existing files keep their own insert (harmless); new ones need not.
+
+2. Test-selection markers (registered in ../pyproject.toml) applied by FILENAME
+   here — the single source of truth for which modules are `integration` / `slow`.
+   Marking never removes a test: the full/nightly lane (`pytest` with no `-m`)
+   still runs every one. It only lets a fast inner loop skip the heavy files:
+       fast:        pytest -m "not integration" -n auto
+       integration: pytest -m "integration"            (serial, env-guarded)
+   The heavy set is measured, not guessed: real OS-subprocess files + files whose
+   real ``time.sleep`` is >= ~1s (heartbeat/timing tests). Sub-second sleepers and
+   fully-mocked tests stay in the default (fast) lane.
+"""
+
+import sys
+from pathlib import Path
+
 import pytest
 
+# (1) sys.path net — idempotent; scripts/ dir is this file's parent.
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
 
-def pytest_configure(config):
-    config.addinivalue_line("markers", "integration: subprocess integration tests (may be slow)")
+
+# (2) Filename-driven marker application. Stems only (no .py). Keep sorted.
+# A file lands in _INTEGRATION_STEMS if it spawns a real OS subprocess / external
+# tool, or does a real time.sleep >= ~1s. _SLOW_STEMS is the heavyweight subset
+# (real driver phase-loop / mass real import subprocesses).
+_INTEGRATION_STEMS = frozenset(
+    {
+        "test_cross_os_hygiene",
+        "test_driver_smoke",
+        "test_halt_ux_e2e",
+        "test_l1_race_fuzz_registry",
+        "test_mechanical_heartbeat",
+        "test_opengrep",
+        "test_p0_judge_table_parser",
+        "test_phase_containment_regression",
+        "test_pty_exec",
+        "test_recon_hardened_subprocess",
+        "test_recon_heartbeat",
+        "test_signal_and_ratelimit",
+        "test_structural_integrity",
+        "test_windows_copy_fallback_install",
+    }
+)
+_SLOW_STEMS = frozenset(
+    {
+        "test_driver_smoke",
+        "test_structural_integrity",
+    }
+)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Apply integration/slow markers by source filename (single source of truth)."""
+    for item in items:
+        stem = Path(str(item.fspath)).stem
+        if stem in _INTEGRATION_STEMS:
+            item.add_marker(pytest.mark.integration)
+        if stem in _SLOW_STEMS:
+            item.add_marker(pytest.mark.slow)
 
 
 @pytest.fixture(autouse=True)

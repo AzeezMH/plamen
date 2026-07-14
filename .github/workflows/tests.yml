@@ -28,6 +28,12 @@ jobs:
       # (.github/workflows/install-smoke.yml) and the interpreter this
       # gate was authored/verified against.
       PYTHON_VERSION: "3.12"
+      # Non-interactive guard: makes the driver's halt/purge prompts
+      # (wait_halt_choice / wait_critical_halt_choice / wait_purge_choice)
+      # auto-answer instead of blocking on a keypress. Without this the
+      # integration lane (test_driver_smoke) hangs forever under CI's
+      # (pseudo-)tty. `exit` = stop cleanly / keep artifacts (never auto-purge).
+      PLAMEN_AUTO_HALT_CHOICE: "exit"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,25 +50,35 @@ jobs:
         run: |
           set -e
           python -m pip install --upgrade pip
-          python -m pip install pytest
-          if [ -f requirements.txt ]; then
-            echo "Installing from requirements.txt"
-            python -m pip install -r requirements.txt
-          elif [ -f pyproject.toml ]; then
-            echo "Installing from pyproject.toml"
-            python -m pip install .
+          # Pinned test deps (pytest + pytest-xdist) via requirements-dev.txt,
+          # which itself pulls in runtime requirements.txt. Fall back cleanly if
+          # the dev file is absent (older checkout).
+          if [ -f requirements-dev.txt ]; then
+            echo "Installing pinned test deps from requirements-dev.txt"
+            python -m pip install -r requirements-dev.txt
+          elif [ -f requirements.txt ]; then
+            echo "Installing from requirements.txt (+ unpinned pytest fallback)"
+            python -m pip install -r requirements.txt pytest pytest-xdist
           else
-            echo "No requirements.txt or pyproject.toml found - skipping dependency install"
+            echo "No requirements file found - installing pytest + pytest-xdist only"
+            python -m pip install pytest pytest-xdist
           fi
 
-      - name: Run scripts/ test suite
-        # scripts/ contains ~285 test_*.py modules covering the audit
-        # pipeline's mechanical substrate (thousands of individual test
-        # cases) - this is a large suite and can take several minutes per
-        # OS. That is intentional: this workflow exists specifically to
-        # catch Windows-only (and macOS-only) behavioral breakage before
-        # it reaches main, so full-suite correctness is prioritized over
-        # CI wall-clock time.
+      # Two lanes, together = the full suite (no test is skipped across them):
+      #   fast lane        — everything EXCEPT the ~14 real-subprocess/timing
+      #                      files, parallelized with xdist (`-n auto`).
+      #   integration lane — ONLY those heavy files, run SERIALLY (they spawn
+      #                      real processes / assert on real timing; xdist would
+      #                      make them flaky). PLAMEN_AUTO_HALT_CHOICE=exit (job
+      #                      env) keeps the driver-loop tests from hanging.
+      # The lanes are separate steps so a failure names which class broke, and
+      # so wall-clock is dominated by the parallel fast lane, not the serial one.
+      - name: Fast lane (unit — parallel)
         shell: bash
         run: |
-          cd scripts && python -m pytest . -q
+          cd scripts && python -m pytest -m "not integration" -n auto -q
+
+      - name: Integration lane (real subprocess/timing — serial)
+        shell: bash
+        run: |
+          cd scripts && python -m pytest -m "integration" -q

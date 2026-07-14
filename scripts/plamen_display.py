@@ -1184,7 +1184,22 @@ def wait_purge_choice() -> bool:
     """Block until user presses Enter (purge) or Esc (keep).
 
     Returns True to purge, False to keep.
+
+    Non-interactive guard (cross-OS, mirrors wait_halt_choice /
+    wait_critical_halt_choice): an explicit ``PLAMEN_AUTO_HALT_CHOICE`` env value
+    or a non-TTY stdin never blocks on a keypress. The safe auto-answer for a
+    destructive purge prompt is always KEEP (return False) — we never auto-purge
+    artifacts. This is what lets the test suite / CI / agent shells run
+    ``test_driver_smoke`` to completion instead of hanging forever on the
+    ``kbhit``/``select`` loop below when ``stdin.isatty()`` is True under a pty.
     """
+    if os.environ.get("PLAMEN_AUTO_HALT_CHOICE", "").strip():
+        return False
+    try:
+        if not sys.stdin.isatty():
+            return False
+    except Exception:
+        return False
     pause_toggle._suspended = True
     try:
         if sys.platform == "win32":
