@@ -210,6 +210,32 @@ delete a finding outright. The full per-function inventory (name, file:line,
 consumes/produces, purpose) lives in
 [internals.md § Mechanical Derivers](internals.md#mechanical-derivers).
 
+### Where the recall increase comes from (generic examples)
+
+The recall gain is precisely this: an attention-gap the LLM was *instructed* to
+check but could not verify it actually did becomes a concrete, mechanically
+emitted candidate — which the normal verifier then confirms or refutes. Each
+row below is a **generic vulnerability shape** (no specific protocol) showing
+the kind of miss the mechanism recovers. None of these asserts a finding; each
+only adds a candidate the verify phase adjudicates.
+
+| Recall-miss class | Deriver | Generic example of what it recovers |
+|---|---|---|
+| **Co-referencer gap** (G1/G2) | `validate_enumeration_coverage` | A finding notes `setFee()` writes `feeBps`, but its prose never mentions the other functions that *read* `feeBps` — e.g. a `quote()` view that now returns a stale value. A candidate is emitted for each unexamined reader. |
+| **Boundary-value gap** (Gate V, axis 2) | `compute_boundary_input_candidates` | A finding confirms a bug at a normal amount but never tried `0`, `1`, type-max, empty, or a self-referential argument — e.g. an amount of `0` that makes a later division blow up to max. A candidate is emitted for the untried boundary. |
+| **Symmetric-operation gap** (Gate V, axis 3) | `compute_symmetric_operation_candidates` | A `deposit` leg is confirmed vulnerable to a rounding direction, but its paired `withdraw` leg has no finding of its own. The unpaired sibling is flagged. |
+| **Duplicate-element amplification** | `compute_array_uniqueness_candidates` | A function loops a caller-supplied array applying a per-element credit with no uniqueness guard — passing the same element twice doubles the credit. |
+| **Unbounded stored input** | `compute_unbounded_input_candidates` | A caller-controlled string/bytes is stored on-chain with no length cap; a huge value bloats storage or bricks a later loop over it (gas-bomb / liveness). |
+| **Stranded critical asset** | `compute_critical_asset_mover_candidates` | A generic transfer helper can move a singleton privileged handle (say, the fee-recipient slot) without excluding it, stranding every function that depends on that handle. |
+| **Un-asserted local invariant** (M1) | `compute_invariant_assertion_candidates` | A verifier marks a bug REFUTED because "the guard at L120 prevents it." That tacit guard is committed as a falsifiable invariant and fuzzed; if it can be bypassed, the original bug re-opens as a candidate. |
+| **Un-examined risk axis** (M2) | `compute_axis_coverage_gaps` | A mechanically-hot function was examined for theft but never for *identity* — whether the caller may act on another party's behalf (the confused-deputy question). The un-examined (function × axis) cell becomes a gap candidate. |
+| **Dropped / orphaned finding** (Gate P) | `route_promotion_orphans` | A depth agent wrote up a real Medium in its own artifact, but consolidation never carried it into the final inventory. The harvest matches the orphan by its `file:line` + harm and routes it back, so a genuine finding cannot silently vanish. |
+
+Working in the opposite direction — precision, not recall — a companion
+**integrity gate** (`_classify_integrity`) downgrades a verdict when a
+verifier's prose claims a passing proof the test never actually executed, so an
+unproven exploit can never ship as verified-Critical.
+
 ---
 
 ## Driver Architecture
