@@ -15073,26 +15073,72 @@ def _rewind_completed_after_overflow(
     checkpoint: "Checkpoint",
     phases: list[Phase],
 ) -> list[str]:
-    """Rewind checkpoint when a completed phase has overflow artifacts.
+    """Rewind checkpoint when a completed phase has UNRECONCILED overflow.
 
-    `_overflow/<phase>/` means that phase wrote artifacts owned by later
-    phases. Even if a retry later passed, the safest resume behavior is to
-    rerun that phase and every completed downstream phase under the current
-    driver/prompt. This prevents an old contaminated `verify_low_c` from
-    being reused after a phase-containment fix lands.
+    `_overflow/<phase>/` means that phase once wrote artifacts owned by later
+    phases (a phase-containment leak that was quarantined out of its scope).
+
+    HEAL-AWARE DEFAULT — do NOT rewind. A non-empty `_overflow/<phase>/` from an
+    already-reconciled run (the phase re-ran and completed cleanly with the
+    foreign files quarantined OUT of its active scope, and downstream phases
+    completed consuming the clean output) is a HISTORICAL record, not a live
+    contamination. Rewinding it discards a substantively-complete audit — the
+    exact failure this default prevents (a stale inventory-leak quarantine
+    should never nuke ~50 completed downstream phases on resume). The per-phase
+    artifact-gate reconcile (`_reconcile_completed_checkpoint_artifacts`) remains
+    the real, precise safety net: it independently rewinds any completed phase
+    whose artifact gate genuinely fails, plus its downstream. So trusting the
+    healed state here loses no correctness. The stale record is archived to
+    `_healed_<ts>` (preserved, inert) so it doesn't re-trigger detection/logging.
+
+    OPT-IN RERUN — for the narrow developer case "I landed a phase-containment
+    FIX and want the affected completed phases rerun under it," set
+    `PLAMEN_REWIND_ON_OVERFLOW=1`: this reruns the contaminated phase and every
+    completed downstream phase (the prior always-on behavior).
     """
-    phase_order = [p.name for p in phases]
-    completed = list(checkpoint.completed or [])
-    contaminated: list[str] = []
     overflow = scratchpad / "_overflow"
     if not overflow.exists():
-        return contaminated
-    for phase_name in completed:
-        phase_dir = overflow / phase_name
-        if phase_dir.exists() and any(phase_dir.iterdir()):
-            contaminated.append(phase_name)
+        return []
+    phase_order = [p.name for p in phases]
+    completed = list(checkpoint.completed or [])
+    contaminated: list[str] = [
+        name for name in completed
+        if (overflow / name).exists() and any((overflow / name).iterdir())
+    ]
     if not contaminated:
         return []
+
+    opt_in = os.environ.get("PLAMEN_REWIND_ON_OVERFLOW", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
+
+    def _archive(name: str, tag: str) -> None:
+        phase_dir = overflow / name
+        if not phase_dir.exists():
+            return
+        archive = overflow / f"{name}_{tag}_{int(time.time())}"
+        try:
+            phase_dir.rename(archive)
+        except OSError:
+            import shutil
+            shutil.move(str(phase_dir), str(archive))
+
+    if not opt_in:
+        # Heal-aware default: trust the reconciled run; archive the stale record
+        # so it stays inert and does not re-trigger detection on later resumes.
+        for name in contaminated:
+            _archive(name, "healed")
+        log.info(
+            "[resume] heal-aware: completed phase(s) %s have stale (already-"
+            "reconciled) overflow; archived to _healed_ WITHOUT rewinding (the "
+            "artifact-gate reconcile still validates each phase). Set "
+            "PLAMEN_REWIND_ON_OVERFLOW=1 to rerun them after a containment fix.",
+            ", ".join(contaminated),
+        )
+        return []
+
+    # Opt-in rerun-after-fix path (prior behavior): rerun the contaminated phase
+    # and every completed downstream phase.
     indices = [phase_order.index(name) for name in contaminated if name in phase_order]
     if not indices:
         return []
@@ -15112,15 +15158,8 @@ def _rewind_completed_after_overflow(
         ]
     # Archive consumed overflow dirs so the next resume doesn't re-detect
     # them and rewind again (infinite loop).
-    for phase_name in contaminated:
-        phase_dir = overflow / phase_name
-        if phase_dir.exists():
-            archive = overflow / f"{phase_name}_rewound_{int(time.time())}"
-            try:
-                phase_dir.rename(archive)
-            except OSError:
-                import shutil
-                shutil.move(str(phase_dir), str(archive))
+    for name in contaminated:
+        _archive(name, "rewound")
     return removed
 
 

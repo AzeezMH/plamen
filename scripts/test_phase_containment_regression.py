@@ -1614,6 +1614,9 @@ def test_SKEPTIC_retry_hint_names_missing_ids(tmp_path: Path):
 
 
 def test_RESUME_overflow_rewinds_completed_phase_and_downstream(tmp_path: Path):
+    # OPT-IN path: with PLAMEN_REWIND_ON_OVERFLOW=1 (a phase-containment fix
+    # landed and you want the affected completed phases rerun under it), a
+    # completed phase with overflow + every downstream completed phase rewind.
     sp = tmp_path / "scratch"
     (sp / "_overflow" / "verify_low_c").mkdir(parents=True)
     (sp / "_overflow" / "verify_low_c" / "report_index.md").write_text(
@@ -1623,12 +1626,52 @@ def test_RESUME_overflow_rewinds_completed_phase_and_downstream(tmp_path: Path):
         completed=["verify_low_b", "verify_low_c", "verify_low_d", "verify_aggregate", "crossbatch"],
         degraded=[],
     )
-    removed = D._rewind_completed_after_overflow(sp, cp, D.L1_PHASES)
+    prev = os.environ.get("PLAMEN_REWIND_ON_OVERFLOW")
+    os.environ["PLAMEN_REWIND_ON_OVERFLOW"] = "1"
+    try:
+        removed = D._rewind_completed_after_overflow(sp, cp, D.L1_PHASES)
+    finally:
+        if prev is None:
+            os.environ.pop("PLAMEN_REWIND_ON_OVERFLOW", None)
+        else:
+            os.environ["PLAMEN_REWIND_ON_OVERFLOW"] = prev
     check(
-        "RESUME.overflow_rewinds_from_contaminated_phase",
+        "RESUME.overflow_rewinds_from_contaminated_phase_when_opted_in",
         removed == ["verify_low_c", "verify_low_d", "verify_aggregate", "crossbatch"]
         and cp.completed == ["verify_low_b"],
         f"removed={removed} completed={cp.completed}",
+    )
+
+
+def test_RESUME_healed_overflow_does_not_rewind_by_default(tmp_path: Path):
+    # HEAL-AWARE DEFAULT (no opt-in): a stale, already-reconciled overflow must
+    # NOT rewind a completed audit — it is archived to `_healed_` and the
+    # checkpoint is left intact. Regression lock for the Spectra resume that
+    # rewound ~50 completed phases back to inventory over a benign, already-
+    # healed inventory-leak quarantine.
+    sp = tmp_path / "scratch"
+    (sp / "_overflow" / "verify_low_c").mkdir(parents=True)
+    (sp / "_overflow" / "verify_low_c" / "report_index.md").write_text(
+        "rogue", encoding="utf-8"
+    )
+    completed = ["verify_low_b", "verify_low_c", "verify_low_d", "verify_aggregate", "crossbatch"]
+    cp = D.Checkpoint(completed=list(completed), degraded=[])
+    prev = os.environ.get("PLAMEN_REWIND_ON_OVERFLOW")
+    os.environ.pop("PLAMEN_REWIND_ON_OVERFLOW", None)
+    try:
+        removed = D._rewind_completed_after_overflow(sp, cp, D.L1_PHASES)
+    finally:
+        if prev is not None:
+            os.environ["PLAMEN_REWIND_ON_OVERFLOW"] = prev
+    healed = list((sp / "_overflow").glob("verify_low_c_healed_*"))
+    check(
+        "RESUME.healed_overflow_no_rewind_default",
+        removed == []
+        and cp.completed == completed
+        and not (sp / "_overflow" / "verify_low_c").exists()
+        and len(healed) == 1,
+        f"removed={removed} completed={cp.completed} "
+        f"healed={[h.name for h in healed]}",
     )
 
 
@@ -1668,6 +1711,7 @@ TESTS_TMP = [
     test_PROMPT_confidence_scores_preserve_depth_feeder_ids,
     test_SKEPTIC_retry_hint_names_missing_ids,
     test_RESUME_overflow_rewinds_completed_phase_and_downstream,
+    test_RESUME_healed_overflow_does_not_rewind_by_default,
 ]
 
 TESTS_BASIC = [
