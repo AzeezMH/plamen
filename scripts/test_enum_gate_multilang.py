@@ -2,7 +2,9 @@
 (critical-asset-mover, array-uniqueness, unbounded-input) exist beyond Solidity,
 so the derivers must fire on Rust (Solana/Soroban/L1), Move (Aptos/Sui), and Go
 (L1) source — and honestly SKIP where a vector's shape does not exist (Go has no
-asset-mover; DAML is unported)."""
+asset-mover; DAML has a `_LANG` entry for the M2 hot-set/axis-coverage matrix
+only — see test_enum_gate_daml.py — and has NONE of the 3 obligation-derivers'
+`with`-block field-type grammar, so all 3 stay a no-op for DAML)."""
 from __future__ import annotations
 
 import importlib
@@ -152,11 +154,17 @@ def test_asset_mover_go_skipped(tmp_path: Path):
 def test_lang_applicability_matrix():
     eg = _eg()
     has_mover = {k: ("mover" in v) for k, v in eg._LANG.items()}
-    # L-04 applies to sol/rust/move, NOT go
-    assert has_mover == {"sol": True, "rust": True, "move": True, "go": False}
-    # L-10 + L-08 apply to all four (array_param + str_param present everywhere)
+    # L-04 applies to sol/rust/move, NOT go, NOT daml
+    assert has_mover == {"sol": True, "rust": True, "move": True,
+                          "go": False, "daml": False}
+    # L-10 + L-08 apply to sol/rust/move/go (array_param + str_param present).
+    # DAML intentionally has neither yet (no `with`-block field-type grammar
+    # parsed) -- both derivers must stay a no-op for it (see test_enum_gate_daml.py).
     for k, v in eg._LANG.items():
-        assert "array_param" in v and "str_param" in v, k
+        if k == "daml":
+            assert "array_param" not in v and "str_param" not in v, k
+        else:
+            assert "array_param" in v and "str_param" in v, k
 
 
 if __name__ == "__main__":

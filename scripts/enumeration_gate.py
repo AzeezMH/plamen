@@ -403,12 +403,29 @@ _MAX_PER_DERIVER = 15   # per-deriver, per-run cap (shared global budget on top)
 # The 3 obligation-derivers are bug-class SHAPES, not Solidity idioms. A language
 # appears for a vector only where that vector's shape genuinely exists (honest
 # applicability — not every vector maps to every ecosystem):
-#   L-04 critical-asset-mover : sol, rust, move      (NOT go node-clients / daml)
-#   L-10 array-uniqueness     : sol, rust, move, go
-#   L-08 unbounded-input      : sol, rust, move, go
-# A vector key absent from a language's spec => that deriver skips that language.
+#   L-04 critical-asset-mover : sol, rust, move          (NOT go node-clients / daml)
+#   L-10 array-uniqueness     : sol, rust, move, go      (NOT daml)
+#   L-08 unbounded-input      : sol, rust, move, go      (NOT daml)
+# A vector key absent from a language's spec => that deriver skips that language
+# (`.get(...)` lookup — see compute_array_uniqueness_candidates /
+# compute_unbounded_input_candidates / compute_critical_asset_mover_candidates).
 # All param regexes use NAMED groups (?P<name>/?P<typ>) so the language-agnostic
 # deriver code reads them uniformly regardless of declaration order.
+#
+# `daml` is intentionally a PARTIAL entry (fn_re + effect only). It exists
+# ONLY to feed the M2 hot-function/axis-coverage matrix (_value_effect_res,
+# compute_hot_function_set, compute_axis_coverage_gaps) — those consumers are
+# language-agnostic and already `.get()`-degrade cleanly for an absent
+# language, so a DAML choice was previously ALWAYS `value_effect=False`,
+# forcing the theft/identity axes to a provable N/A even for a value-moving
+# choice whose only state reference happens to be a uniquely-referenced field
+# (dropped by `_finalize_source_graph`'s `1 < len(fns) <= 25` var_refs filter
+# in recon_prepass.py). `effect` below closes that hole. L-04/L-08/L-10 need a
+# `with`-block field-type grammar (`array_param`/`str_param`/`mover`/
+# `id_param`/`asset_handle`) this entry does NOT parse — those keys are
+# deliberately omitted so those 3 derivers stay a no-op for DAML rather than
+# fabricate an unvalidated param-shape regex with no real DAML repo to
+# validate it against (see plamen_repo research note, applicability verdict).
 def _c(p):
     return re.compile(p, re.MULTILINE)
 
@@ -481,6 +498,29 @@ _LANG = {
                        r"|=\s*[^;\n]*\b{p}\b"),
         "lenguard_tpl": r"len\(\s*{p}\s*\)\s*(?:<=|<|>=|>)",
         # no mover/id_param/asset_handle: L-04 N/A for Go node-clients.
+    },
+    "daml": {
+        "suffix": (".daml",),
+        # group(1)=choice name — SAME grammar as recon_prepass._DAML_CHOICE_RE
+        # so the bare name here joins the choice-keyed graph `_bake_daml_graph`
+        # emits (`functions`/`var_refs` are keyed by choice name, not a
+        # `Contract.choice` qualified path). group(2) is a throwaway
+        # rest-of-declaration-line capture — `_iter_functions` requires a 2nd
+        # group (`m.group(2)`); DAML choice syntax has no parenthesized param
+        # list to capture, unlike sol/rust/move/go.
+        "fn_re": _c(r"\b(?:nonconsuming\s+)?choice\s+(\w+)\b([^\n]*)"),
+        # DAML value/authority movement: creating or archiving a contract (or
+        # exercising another choice, which recurses into more create/archive)
+        # is the only way a choice moves the value/quantity a contract
+        # represents between parties — the DAML analog of sol's transfer/mint
+        # or rust's token::transfer. Sets `value_effect=True` for
+        # compute_hot_function_set / the theft+identity axis N/A gate in
+        # compute_axis_coverage_gaps (both consume `_value_effect_res`).
+        "effect": _c(r"\b(?:create|createAndExercise|archive|exercise|exerciseByKey)\b"),
+        # Deliberately NO array_param/str_param/loop/uniq_guard/stored_tpl/
+        # lenguard_tpl/mover/id_param/asset_handle: L-04/L-08/L-10 need a
+        # `with`-block field-type grammar this entry does not parse, so those
+        # 3 derivers stay a no-op for DAML (see the block comment above).
     },
 }
 _SUPPORTED_SUFFIXES = tuple(s for spec in _LANG.values() for s in spec["suffix"])
@@ -738,7 +778,10 @@ def compute_array_uniqueness_candidates(scratchpad: Path) -> list:
             if len(out) >= _MAX_PER_DERIVER:
                 break
             spec = _LANG[lang]
-            arr = spec["array_param"].search(params)
+            arr_re = spec.get("array_param")
+            if arr_re is None:   # L-10 N/A for this language (e.g. DAML: no
+                continue         # `with`-block field-type grammar parsed yet)
+            arr = arr_re.search(params)
             if not arr:
                 continue
             arrname = arr.group("name")
@@ -810,7 +853,10 @@ def compute_unbounded_input_candidates(scratchpad: Path) -> list:
                 head = body[:body.find("{")] if "{" in body else body[:160]
                 if re.search(r"\b(?:pure|view)\b", head):
                     continue
-            for m in spec["str_param"].finditer(params):
+            str_param_re = spec.get("str_param")
+            if str_param_re is None:   # L-08 N/A for this language (e.g. DAML:
+                continue                # no `with`-block field-type grammar yet)
+            for m in str_param_re.finditer(params):
                 pname = m.group("name")
                 typ = (m.groupdict().get("typ") or "input").strip()
                 p = re.escape(pname)
