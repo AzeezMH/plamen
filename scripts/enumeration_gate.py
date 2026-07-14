@@ -27,6 +27,7 @@ No-overfit: pure graph mechanics, names no protocol.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -1331,6 +1332,53 @@ def compute_invariant_assertion_candidates(scratchpad: Path) -> list:
 _MAX_HOT_FUNCTIONS = 40          # mirrors _MAX_ENUMGAP_PER_RUN; budget lands on core
 _CALLER_THRESHOLD = 2            # "hot" caller count floor (a fn ≥2 callers is core)
 
+# ── Hot-set scoring (Formula-2: log-dampened, distribution-robust blend) ──
+# Fan-in is a POOR primary risk signal (popularity ≠ risk): a shared math util
+# can rank above a value-mover purely on caller count. We log-dampen fan-in so it
+# stays a BLENDED term (never dominant, never dropped — a util between entries and
+# sinks is legitimately hot), keep the security terms (writes/elevate/value) at
+# their prior linear weight, and add a MILD, FLAT entry-point bonus. A graded /
+# strong entry bonus was rejected empirically: it produces a wide score tie
+# (arbitrary alphabetical selection) AND evicts value-movers (burn/redeem) — the
+# value-mover-eviction failure. These weights are conservative and validated by
+# the fixtures in test_hotset_scoring.py against synthetic SCIP- and EVM-shaped
+# caller distributions (no value-mover eviction, no tie collapse). Purely a
+# topology/structure reweight — ZERO protocol/token/function vocabulary.
+_W_FANIN = 1.0                   # coefficient on log2(n_callers + 1)
+_W_WRITES = 2.0                  # touches security-relevant state
+_W_ELEVATE = 2.0                 # recon [ELEVATE] tag
+_W_VALUE = 2.0                   # value-effect regex match (can move value)
+_W_ENTRY = 1.0                   # mild, FLAT entry-point bonus (not graded)
+_ENTRY_THRESH = 1                # n_callers ≤ this ⇒ structural entry-point proxy
+
+# Generic Rust/stdlib/EVM builtin METHOD names the graph's var_refs wrongly count
+# as state symbols (`.mul()`, `.unwrap_or()`, `.assert()` etc.), giving math-util
+# leaf functions false writes=True + inflated fan-in. This is a topology/vocabulary
+# filter — it names ZERO protocol/token/function concepts, only generic language
+# builtins, and benefits every Rust/Move/Sol codebase using checked-math idioms.
+_BUILTIN_METHOD_DENYLIST = frozenset({
+    "mul", "div", "add", "sub", "abs", "min", "max", "pow",
+    "unwrap", "unwrap_or", "expect", "clone", "into", "from",
+    "borrow", "deref", "assert", "ok", "ok_or",
+    "is_some", "is_none", "len", "iter", "map",
+})
+# Builtin method FAMILIES matched by prefix (checked_add, saturating_sub,
+# wrapping_mul, as_u128, ...). Generic language vocabulary only.
+_BUILTIN_METHOD_PREFIXES = ("checked_", "saturating_", "wrapping_", "as_")
+
+
+def _is_builtin_method(bare: str) -> bool:
+    """True iff `bare` (lowercased bare symbol) is a generic language builtin
+    method name that must NOT count as a contract state symbol. Exact match
+    against the denylist OR a denylisted prefix family. Generic-only; no protocol
+    vocabulary."""
+    b = (bare or "").lower()
+    if not b:
+        return False
+    if b in _BUILTIN_METHOD_DENYLIST:
+        return True
+    return b.startswith(_BUILTIN_METHOD_PREFIXES)
+
 # The orthogonal risk axes (HOW-shaped question per function). Order is
 # stable so the matrix columns are deterministic. `identity` = CWE-863/CWE-441/
 # CWE-639-shaped authorization-subject coverage: was the caller<->subject
@@ -1408,12 +1456,26 @@ def _load_function_summary(scratchpad: Path) -> dict:
         text = p.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return out
+    # HEADER-DRIVEN callers column: the Callers column index differs across
+    # schemas (SCIP places it at index 4; the EVM function_summary.md schema uses
+    # a different column order). Parse the header row to find the column whose
+    # label is "Callers" (case-insensitive) and use that index for data rows.
+    # Fall back to the legacy cells[4]-if-int behavior when no labelled header is
+    # found, so SCIP-shaped summaries still parse cleanly.
+    callers_idx = None  # resolved from the table header when available
     for ln in text.splitlines():
         s = ln.strip()
-        if not s.startswith("|") or "---" in s or "Function" in s:
+        if not s.startswith("|") or "---" in s:
             continue
         cells = [c.strip() for c in s.strip("|").split("|")]
         if not cells:
+            continue
+        # Header row: locate the "Callers" column by label, then skip the row.
+        if "Function" in ln:
+            for i, c in enumerate(cells):
+                if c.strip("` ").strip().lower() == "callers":
+                    callers_idx = i
+                    break
             continue
         fn_cell = cells[0].strip("` ").strip()
         if not fn_cell:
@@ -1422,14 +1484,15 @@ def _load_function_summary(scratchpad: Path) -> dict:
         if not bare:
             continue
         callers = 0
-        # SCIP layout: | Function | File | Line | Kind | Callers | Callees |
-        for c in cells[1:]:
-            if re.fullmatch(r"\d+", c):
-                # first integer-only cell after the name is not necessarily
-                # callers; the SCIP Callers column is index 4. Prefer it when the
-                # row has the SCIP shape, else fall back to the first int seen.
-                pass
-        if len(cells) >= 5 and re.fullmatch(r"\d+", cells[4]):
+        if callers_idx is not None and callers_idx < len(cells) \
+                and re.fullmatch(r"\d+", cells[callers_idx]):
+            # Header-resolved column (works across SCIP/EVM/Move schemas).
+            try:
+                callers = int(cells[callers_idx])
+            except ValueError:
+                callers = 0
+        elif len(cells) >= 5 and re.fullmatch(r"\d+", cells[4]):
+            # Legacy fallback: SCIP layout | Function | File | Line | Kind | Callers | Callees |
             try:
                 callers = int(cells[4])
             except ValueError:
@@ -1471,7 +1534,15 @@ def compute_hot_function_set(scratchpad: Path) -> list:
         if graph is not None:
             for _vk, vd in graph.get("var_refs", {}).items():
                 for d in vd.get("refs", []):
-                    fn_writes.add(_bare_from_descriptor(d).lower())
+                    bare_ref = _bare_from_descriptor(d).lower()
+                    # DENOISE: the graph's var_refs count generic builtin method
+                    # calls (.mul()/.unwrap_or()/.assert()) as if they were state
+                    # symbols, giving math-util leaves false writes=True. Drop
+                    # descriptors whose bare symbol is a language builtin. Topology
+                    # filter — no protocol vocabulary.
+                    if _is_builtin_method(bare_ref):
+                        continue
+                    fn_writes.add(bare_ref)
 
         # value-effect scan over production function bodies (per language present).
         # Maps bare-name(lower) -> (lang, has_value_effect). Deterministic source
@@ -1528,10 +1599,13 @@ def compute_hot_function_set(scratchpad: Path) -> list:
             is_hot = (n_callers >= _CALLER_THRESHOLD or writes or elevate or has_eff)
             if not is_hot:
                 continue
-            score = (n_callers
-                     + (2 if writes else 0)
-                     + (2 if elevate else 0)
-                     + (2 if has_eff else 0))
+            # Formula-2: log-dampened fan-in blended with the (unchanged) security
+            # terms + a mild flat entry-point bonus. See _W_* rationale above.
+            score = (_W_FANIN * math.log2(n_callers + 1)
+                     + (_W_WRITES if writes else 0.0)
+                     + (_W_ELEVATE if elevate else 0.0)
+                     + (_W_VALUE if has_eff else 0.0)
+                     + (_W_ENTRY if n_callers <= _ENTRY_THRESH else 0.0))
             hot.append({
                 "function": info.get("bare", fk),
                 "loc": info.get("loc", loc_by_fn.get(bare, "?")),
