@@ -86,7 +86,7 @@ def test_phase_artifact_state_records_owner_and_quarantine_status(tmp_path: Path
         "sc",
         before,
     )
-    moved = D._quarantine_foreign_phase_writes(
+    moved, failed = D._quarantine_foreign_phase_writes(
         scratchpad,
         str(project),
         "rag_sweep",
@@ -95,6 +95,7 @@ def test_phase_artifact_state_records_owner_and_quarantine_status(tmp_path: Path
     state = D._read_artifact_state(scratchpad)
 
     assert moved == ["hypotheses.md"]
+    assert failed == []
     assert state["artifacts"]["hypotheses.md"]["status"] == "QUARANTINED"
     assert state["artifacts"]["hypotheses.md"]["quarantined_by_phase"] == "rag_sweep"
 

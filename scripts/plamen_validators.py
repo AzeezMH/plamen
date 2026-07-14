@@ -14975,7 +14975,7 @@ def _quarantine_foreign_phase_writes(
     project_root: str,
     phase_name: str,
     offenders: list[str],
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """Move foreign later-phase artifacts aside after containment detection.
 
     `_quarantine_phase_overreach` handles a narrow allowlist before the
@@ -14983,11 +14983,24 @@ def _quarantine_foreign_phase_writes(
     `../AUDIT_REPORT.md` in the project root. Leaving a rogue project-root
     report in place made an earlier verifier-authored report look published
     even though the real report phases never ran.
+
+    Returns ``(moved, failed)``. ``failed`` names any rogue later-phase artifact
+    that could NOT be moved and is STILL at its root path — a live containment
+    hole (a downstream consumer could read it, and neither the resume
+    overflow-rewind — no ``_overflow`` entry is created — nor the reconcile —
+    which checks EXPECTED artifacts, not ROGUE ones — would catch it). The caller
+    MUST fail/re-run the phase when ``failed`` is non-empty rather than mark it
+    complete with a live foreign file in place. The move itself is hardened:
+    ``rename`` first, then a ``shutil.move`` copy+delete fallback for a transient
+    lock / cross-device case, so a genuine ``failed`` means the file is truly
+    stuck (e.g. held open elsewhere) and only a phase re-run can clear it.
     """
     if not offenders:
-        return []
+        return [], []
+    import shutil
     overflow_dir = scratchpad / "_overflow" / phase_name
     moved: list[str] = []
+    failed: list[str] = []
     for name in offenders:
         if name == "../AUDIT_REPORT.md":
             src = Path(project_root) / "AUDIT_REPORT.md"
@@ -14997,19 +15010,28 @@ def _quarantine_foreign_phase_writes(
             src = scratchpad / name
         if not src.exists() or not src.is_file():
             continue
+        moved_ok = False
         try:
             overflow_dir.mkdir(parents=True, exist_ok=True)
             dst = overflow_dir / src.name
             if dst.exists():
                 import time as _t
                 dst = overflow_dir / f"{src.stem}.{int(_t.time())}{src.suffix}"
-            src.rename(dst)
+            try:
+                src.rename(dst)
+            except OSError:
+                # transient lock / cross-device: fall back to copy+delete.
+                shutil.move(str(src), str(dst))
             moved.append(name)
+            moved_ok = True
         except Exception as e:
             log.warning(
                 f"[{phase_name}] quarantine of foreign artifact {name} "
                 f"failed: {e}"
             )
+        if not moved_ok and src.exists():
+            # Could not move it AND it is still live at root -> containment hole.
+            failed.append(name)
     if moved:
         _mark_artifacts_quarantined(scratchpad, project_root, phase_name, moved)
         try:
@@ -15023,7 +15045,7 @@ def _quarantine_foreign_phase_writes(
                     f.write(f"- {name} -> _overflow/{phase_name}/\n")
         except Exception:
             pass
-    return moved
+    return moved, failed
 
 
 def _quarantine_report_without_completed_assemble(

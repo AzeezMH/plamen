@@ -14995,7 +14995,7 @@ def _run_phase_validators(
         # in the scratchpad root at their expected names for the owning
         # phase's resumption protocol to consume).
         quarantine_targets = [f for f in foreign_writes if f not in adopted_foreign]
-        moved_foreign = _quarantine_foreign_phase_writes(
+        moved_foreign, failed_foreign = _quarantine_foreign_phase_writes(
             scratchpad, config["project_root"], phase.name,
             quarantine_targets
         )
@@ -15004,6 +15004,20 @@ def _run_phase_validators(
                 f"[{phase.name}] quarantined foreign later-phase "
                 f"artifact(s): {moved_foreign[:10]}"
             )
+        if failed_foreign:
+            # A rogue later-phase artifact could not be moved and is STILL live
+            # at root (e.g. held open elsewhere). Do NOT complete the phase with
+            # it in place — neither the resume overflow-rewind (no _overflow
+            # entry) nor the reconcile (checks expected, not rogue, artifacts)
+            # would catch it. Fail the gate so the driver re-runs the phase and
+            # clears it.
+            passed = False
+            missing = list(missing) + [
+                "phase containment: could not quarantine rogue later-phase "
+                "artifact(s) still live at root (re-running phase to clear): "
+                + ", ".join(failed_foreign[:10])
+            ]
+            return passed, missing
         if adopted_foreign:
             log.warning(
                 f"[{phase.name}] adopted sibling artifact(s) "
@@ -20593,7 +20607,7 @@ def main():
                     )
                 if _recov_passed:
                     if _existing_foreign:
-                        moved_foreign = _quarantine_foreign_phase_writes(
+                        moved_foreign, failed_foreign = _quarantine_foreign_phase_writes(
                             scratchpad, config["project_root"], phase.name,
                             _existing_foreign,
                         )
@@ -20601,7 +20615,11 @@ def main():
                             f"[{phase.name}] artifact-recovery rejected "
                             f"pre-existing later-phase artifact(s): "
                             f"{_existing_foreign[:10]}; quarantined={moved_foreign[:10]}"
+                            + (f"; STILL-LIVE-AT-ROOT={failed_foreign[:10]}"
+                               if failed_foreign else "")
                         )
+                        # recovery is already rejected below (_recov_passed=False
+                        # -> phase re-runs), which also clears any failed_foreign.
                         _recov_passed = False
                         _recov_missing = [
                             "phase containment: pre-existing later-phase artifacts: "

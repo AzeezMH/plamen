@@ -1078,7 +1078,7 @@ def test_CONTAINMENT_rogue_report_artifacts_detected_and_quarantined(tmp_path: P
         "report_index.md" in offenders,
         repr(offenders),
     )
-    moved = D._quarantine_foreign_phase_writes(
+    moved, failed = D._quarantine_foreign_phase_writes(
         scratchpad,
         str(project),
         "verify_low_c",
@@ -1087,9 +1087,10 @@ def test_CONTAINMENT_rogue_report_artifacts_detected_and_quarantined(tmp_path: P
     check(
         "CONTAINMENT.quarantines_project_root_report",
         "../AUDIT_REPORT.md" in moved
+        and not failed
         and not (project / "AUDIT_REPORT.md").exists()
         and (scratchpad / "_overflow" / "verify_low_c" / "AUDIT_REPORT.md").exists(),
-        f"moved={moved}",
+        f"moved={moved} failed={failed}",
     )
     check(
         "CONTAINMENT.quarantines_scratchpad_report_index",
@@ -1675,6 +1676,36 @@ def test_RESUME_healed_overflow_does_not_rewind_by_default(tmp_path: Path):
     )
 
 
+def test_CONTAINMENT_move_failure_reports_failed_and_keeps_file_live(tmp_path: Path):
+    # Move-failure hardening: if a rogue foreign later-phase artifact CANNOT be
+    # moved to _overflow (e.g. held open elsewhere), the helper must report it in
+    # `failed` (so the caller fails/re-runs the phase) rather than silently leave
+    # it live at root with an empty _overflow dir. Regression lock for the
+    # quarantine move-failure hole that neither the resume overflow-rewind (no
+    # _overflow entry) nor the reconcile (checks EXPECTED, not ROGUE, artifacts)
+    # would catch. The failure is forced via a real fs condition: the phase's
+    # _overflow path is pre-created as a FILE so mkdir(parents=True) cannot make
+    # the destination dir, the move cannot complete, and the file stays at root.
+    sp = tmp_path / "scratch"
+    sp.mkdir()
+    project = tmp_path / "proj"
+    project.mkdir()
+    (sp / "report_index.md").write_text("rogue later-phase artifact", encoding="utf-8")
+    (sp / "_overflow").mkdir()
+    (sp / "_overflow" / "verify_low_c").write_text("not-a-dir", encoding="utf-8")
+    moved, failed = D._quarantine_foreign_phase_writes(
+        sp, str(project), "verify_low_c", ["report_index.md"]
+    )
+    check(
+        "CONTAINMENT.move_failure_reports_failed_keeps_file_live",
+        moved == []
+        and failed == ["report_index.md"]
+        and (sp / "report_index.md").exists(),
+        f"moved={moved} failed={failed} "
+        f"still_at_root={(sp / 'report_index.md').exists()}",
+    )
+
+
 TESTS_TMP = [
     test_PROMPT_l1_verify_shard_does_not_see_future_step5_subphases,
     test_PROMPT_sc_verify_shard_does_not_import_broad_language_phase5,
@@ -1712,6 +1743,7 @@ TESTS_TMP = [
     test_SKEPTIC_retry_hint_names_missing_ids,
     test_RESUME_overflow_rewinds_completed_phase_and_downstream,
     test_RESUME_healed_overflow_does_not_rewind_by_default,
+    test_CONTAINMENT_move_failure_reports_failed_and_keeps_file_live,
 ]
 
 TESTS_BASIC = [
