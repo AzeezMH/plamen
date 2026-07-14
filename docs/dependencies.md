@@ -262,6 +262,47 @@ Set keys in `~/.claude/mcp.json` (Claude Code) after copying from `mcp.json.exam
 
 ---
 
+## Development & Test Suite (Contributors)
+
+> These are **dev-only** dependencies for running Plamen's own test suite — not
+> needed to run audits, and not read by the installer or the audit runtime.
+> Runtime deps stay in `requirements.txt`; test-only deps are layered
+> separately so a production install never pulls them in.
+
+| Tool | Version | Purpose | Install |
+|------|---------|---------|---------|
+| pytest | pinned (see `requirements-dev.txt`) | Test runner | `pip install -r requirements-dev.txt` |
+| pytest-xdist | pinned (see `requirements-dev.txt`) | Parallel test execution (`-n auto`) | `pip install -r requirements-dev.txt` |
+
+```bash
+pip install -r requirements.txt        # runtime deps
+pip install -r requirements-dev.txt    # + test-only deps, layered on top
+```
+
+**Pytest markers** (`pyproject.toml` → `[tool.pytest.ini_options]`): tests are
+registered under `unit`, `integration`, and `slow` markers. Tests that spawn a
+real subprocess or a real multi-second sleep are auto-marked by filename from
+a single source of truth — no per-test annotation needed.
+
+**CI lanes** (`.github/workflows/tests.yml`): the full suite runs on push/PR
+across the three supported operating systems, split into two lanes that
+together cover every test:
+- **Fast lane**: marker-excluded fast tests, parallelized across all CPU cores
+  via `pytest-xdist` (`-n auto`).
+- **Integration lane**: the slower/integration-marked tests, run serially.
+
+Both lanes force the same non-interactive-safe environment override used
+locally (see below) so neither lane can block on an interactive prompt.
+
+**Non-interactive test runs**: a couple of confirmation prompts (e.g. an
+artifact-purge confirmation) poll for a keypress and will hang indefinitely
+under a non-TTY execution context (CI, an agent shell). These prompts honor a
+cross-platform environment-variable override and a non-interactive-terminal
+guard that defaults safely to "keep artifacts, do not auto-purge" — the same
+mechanism already used by other confirmation prompts in the codebase.
+
+---
+
 ## Troubleshooting
 
 ### Common install failure modes

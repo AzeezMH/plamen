@@ -1,6 +1,6 @@
 # Audit Modes
 
-> Plamen v2.2.3. All modes run through the PTY-supervised V2 driver
+> Plamen v2.2.4. All modes run through the PTY-supervised V2 driver
 > (`plamen_driver.py`) on Windows, macOS, and Linux, with either the Claude Code
 > or OpenAI Codex CLI backend.
 
@@ -36,6 +36,10 @@
 
 > **Deterministic plumbing**: Fragile LLM-prose-parsing phases have been replaced with deterministic Python — mechanical SC `report_index` recovery, mechanical verify backfill / queue manifests, and the data-loss-free `report_dedup` builder — so structure-assembly steps no longer depend on LLM output shape.
 
+> **Mechanical recall gates** (Core and Thorough): three graph-grounded, always-on gates catch recurring miss classes before report assembly. A variant-coverage gate checks a confirmed finding's co-referencing functions, boundary-value set, and any structurally-paired sibling operation for matching coverage. An external-dependency research gate has recon bake a citation ledger for every detected external dependency so depth/verify phases can ground worst-case assumptions instead of guessing (an uncited assumption caps at code-trace-level evidence). A promotion-completeness gate reconciles every intermediate finding artifact against the final inventory by location so a candidate can never silently vanish between phases. All three route through the existing verify-the-positives filter and material-harm floor — recall-safe (never drop) and precision-safe (never assert severity directly).
+
+> **Force-by-default PoC gate** (Phase 5, all modes): a mechanical, label-independent check forces any finding with a concrete stated material harm into an executed PoC attempt unless it matches one of a small closed set of code-grounded blockers (fully-trusted-actor design, deploy/transaction-ordering dependency, an external dependency with no available fork, a required live external artifact, or no on-chain state delta to assert). A forced attempt that still cannot construct a harm assertion is recorded as traced-but-unexecuted with the named blocker — never as a failed or refuted PoC.
+
 ## When to Use Each
 
 - **Light**: Pro plan, codebases under 3000 lines, quick first pass. Reports all severities but skips semantic invariants, fuzzing, and design stress testing.
@@ -57,10 +61,12 @@ L1 infrastructure audits use the same Light/Core/Thorough tiers with these diffe
 | Languages | Go, Rust (instead of Solidity, Move, etc.) |
 | Depth agents | + depth-consensus-invariant, depth-network-surface; no depth-token-flow |
 | Phase 0.5 | Bake phase: deterministic SCIP batch indexing — `_bake_go_scip` (Go) and rust-analyzer SCIP (Rust) |
-| Phase 4c | Removed (no chain analysis for L1 point vulnerabilities) |
+| Phase 4c | Removed (no chain analysis for L1 point vulnerabilities); a cross-domain-dependency-tag harvester feeds low-confidence candidates into the verification queue as the minimal generic replacement |
 | Severity matrix | L1-specific, aligned with Immunefi v2.3 |
 | Skills | 22+ L1 injectable skills (consensus, p2p, mempool, RPC, validator, etc.) |
 | Evidence tags | + [DIFF-PASS], [CONFORMANCE-PASS], [NON-DET-PASS], [FUZZ-PASS], [LSP-TRACE] |
+| Pre-breadth hook | Mechanical dependency-vulnerability scan (language-appropriate tooling), degrades gracefully if not installed |
+| Race/concurrency findings | Mechanical verification re-runs with a race-detector instrumentation and an extended timeout instead of the default PoC-exempt structural bucket |
 
 ```bash
 plamen l1 core /path/to/node-client    # terminal wrapper (both backends)

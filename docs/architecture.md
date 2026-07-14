@@ -1,6 +1,6 @@
 # Architecture
 
-> Plamen v2.2.3. The default analysis model is Opus 4.8 (`claude-opus-4-8`),
+> Plamen v2.2.4. The default analysis model is Opus 4.8 (`claude-opus-4-8`),
 > resolved via `PLAMEN_OPUS_MODEL` / `PLAMEN_THOROUGH_OPUS_MODEL` in
 > `scripts/plamen_types.py`. Runs on Windows, macOS, and Linux.
 
@@ -101,7 +101,7 @@ Worker-pool phase. The driver builds a manifest row per agent, then `_run_breadt
 
 ### Phase 4a: Inventory + Side Effect Trace
 
-Consolidates all findings, promotes static analysis results, performs side effect trace audit on external token interactions.
+Consolidates all findings, promotes static analysis results, performs side effect trace audit on external token interactions. A mechanical co-reference enumeration gate (Python, no LLM) additionally cross-checks each inventory finding against the reference graph and appends a low-confidence candidate for any co-referencing function the finding's own prose never addressed — see [Mechanical Recall Gates](#mechanical-recall-gates) below.
 
 ### Phase 4a.5: Semantic Invariant Pre-Computation
 
@@ -136,6 +136,8 @@ Worker-pool phase (`_run_depth_worker_pool_pty`, `scripts/plamen_driver.py:10265
 
 **Confidence scoring** (sonnet, batched): 4-axis model (Evidence x 0.25 + Consensus x 0.25 + Analysis Quality x 0.3 + RAG Match x 0.2).
 
+**Axis-coverage meta-pass** (mechanical, no LLM, all modes): deterministically ranks the codebase's mechanically-hot functions (fan-in, state-writes, privilege, value-movement signals) and cross-checks each against a fixed risk-axis matrix (theft / liveness / accounting / provenance / boundary / identity), so a hot function never examined against a given risk axis becomes a gap candidate instead of silently passing. Part of the [Mechanical Recall Gates](#mechanical-recall-gates) layer below.
+
 ### Phase 4b.6: Exploration-Completeness Skeptic (Thorough only)
 
 Recall-positive additive soft phase that audits whether the depth loop left
@@ -169,6 +171,44 @@ A durable post-report deduplication phase (`report_dedup`, dispatched at
 data-loss-free dedup over the full candidate set with a precision-guarded
 cross-tier same-fix catch — recall-positive, and a non-fatal failure never
 blocks delivery of `AUDIT_REPORT.md`.
+
+---
+
+## Mechanical Recall Gates
+
+Layered underneath the LLM phases above, a set of deterministic Python
+functions — the **deriver/gate layer** — generates, gates, promotes, and
+reconciles findings directly against scratchpad artifacts and a mechanically
+built reference graph, with no LLM call. This closes recall-miss classes that
+were previously only advisory prose instructions to an LLM (which could not
+verify its own compliance). Three families:
+
+- **Recall-generators** (`enumeration_gate.py`) — read the mechanical
+  reference graph plus the finding inventory and emit low-confidence
+  candidates for co-referencing functions never examined, unaddressed
+  boundary values, unpaired symmetric operations, and un-asserted local
+  invariants a confirmed/refuted finding implicitly relies on. This family
+  includes the axis-coverage meta-pass described under Phase 4b above.
+- **Gates** (`enumeration_gate.py`, `plamen_mechanical.py`,
+  `mechanical_verify.py`) — reconcile candidate or harvested findings against
+  the coverage seed or actual verifier execution and route survivors into the
+  inventory; includes the promotion-completeness harvest/router and the
+  verifier-prose-vs-mechanical-execution integrity gate that downgrades a
+  verdict when prose claims outrun what the PoC actually proved.
+- **Bake providers** (`recon_prepass.py`) — tiered, per-ecosystem reference
+  graph construction (a precise indexer when the toolchain is available and
+  the project builds, else a compile-free approximate source parse — never
+  mocked to force a compile) that every recall-generator and gate above reads
+  from, plus mechanical pre-pass flag seeding independent of the recon LLM
+  pass.
+
+Every deriver in this layer is append-only, idempotent (receipt-gated so a
+retry never double-emits), and routes exclusively through the pipeline's
+existing verify-the-positives filter and material-harm body floor — it can
+only add a low-confidence candidate for later verification, never assert or
+delete a finding outright. The full per-function inventory (name, file:line,
+consumes/produces, purpose) lives in
+[internals.md § Mechanical Derivers](internals.md#mechanical-derivers).
 
 ---
 
@@ -217,6 +257,7 @@ Key properties:
 - **Deterministic gating**: artifact existence and marker hygiene are checked mechanically. The LLM never self-reports completion to the driver's state machine.
 - **Ecosystem auto-detect**: the language/ecosystem is detected and auto-corrected at startup (no halt-to-rerun), shown on the startup banner, and resolved via manifest-priority rules (`config.language` reconciliation around `scripts/plamen_driver.py:16736`). A suffix-only signal never clobbers an explicit config; high-confidence cases such as Pinocchio and native-SDK Solana are corrected automatically, while ambiguous cases stay conservative (recall-safe — a wrong auto-correct is worse than the status quo).
 - **Haltless at the finish line**: late-stage gates degrade-with-flag instead of halting (see *Haltless Resilience* below).
+- **Cross-OS verified**: the driver's own Python source is checked by an always-on static hygiene gate (missing text-encoding on subprocess/file APIs, unguarded platform-only imports, hardcoded interpreter invocations), and the full test suite runs on Windows, macOS, and Linux on every push/PR — real OS coverage the static gate alone cannot provide.
 
 ---
 

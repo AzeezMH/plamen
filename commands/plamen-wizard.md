@@ -20,7 +20,7 @@ Output:
 ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═══╝
 ```
 
-**Web3 Security Auditor** v2.2.3 — Deterministic Driver
+**Web3 Security Auditor** v2.2.4 — Deterministic Driver
 
 Then run the toolchain probe:
 

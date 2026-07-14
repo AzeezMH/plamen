@@ -20,7 +20,7 @@ Output:
 ╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═╝  ╚═══╝
 ```
 
-**L1 Infrastructure Auditor** v2.2.3 — Deterministic Driver
+**L1 Infrastructure Auditor** v2.2.4 — Deterministic Driver
 
 ```
 ┌─ L1 Infrastructure Mode ──────────────────────────────┐

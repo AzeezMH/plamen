@@ -1,4 +1,4 @@
-# Plamen (v2.2.3)
+# Plamen (v2.2.4)
 
 Autonomous Web3 security auditor for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [OpenAI Codex CLI](https://github.com/openai/codex).
 
@@ -309,15 +309,16 @@ normally never need to open it; `AUDIT_REPORT.md` is the deliverable. See
 
 ---
 
-## What Changed in v2.1.0
+## What Changed in v2.2.4
 
-v2.1.0 changes *how* the pipeline runs, not what the agents analyze. Highlights:
+Highlights since v2.1.0 — recall-focused mechanical gates and cross-platform hardening, not a change to *what* the agents analyze:
 
-- **PTY-supervised execution + disk-derived completion** — workers are driven through a pseudo-terminal and completion is inferred from on-disk `<!-- PLAMEN_STATUS: COMPLETE -->` markers, eliminating the 0-byte-stdio silent-hang class.
-- **Haltless recovery** — `report_index`, verify, inventory, and resume paths repair-then-degrade and surface unfinished obligations as Appendix-B items instead of halting.
-- **Codex CLI backend (cost-saving BETA)** — OpenAI Codex (`codex exec`) as an alternative worker backend. See [docs/codex-backend.md](docs/codex-backend.md) for its known limitations.
-- **Opus 4.8 defaults** — Opus-tier phases default to `claude-opus-4-8` (override with `PLAMEN_OPUS_MODEL` / `PLAMEN_THOROUGH_OPUS_MODEL`).
-- **Ecosystem auto-detection** — the audited language is detected and auto-corrected at startup, no halt-to-rerun.
+- **M2 multi-axis coverage meta-pass, now 6 axes** — a driver-owned hot-function set is checked across orthogonal analysis axes (including a caller-identity / authorization-subject axis), detecting gaps only from the closed depth-evidence-tag vocabulary so ambiguity resolves to "gap," never to false confidence.
+- **Mechanical recall gates** — sibling/variant-coverage, external-dependency research-with-citation, and pipeline promotion-completeness are now graph-grounded, append-only gates instead of advisory prose, each routing low-confidence candidates through the existing verify-then-report filter rather than asserting a body finding directly.
+- **Force-by-default PoC gate** — any finding with a concrete material harm is now forced into an executable proof-of-concept attempt unless a small closed set of code-grounded blockers applies, closing a self-declared-skip loophole across every supported ecosystem.
+- **Non-EVM PoC execution hardened** — cargo-workspace test discovery for Rust-based ecosystems, plus a fixed PoC-registry lookup that had silently missed on non-EVM dispatch.
+- **Cross-OS hygiene gate + full CI matrix** — an always-on static gate over the driver's own source catches missing text-encodings and platform-only code paths, backed by CI running the full suite on Windows/macOS/Linux with a fast parallel lane and a serial integration lane.
+- **DAML/Canton coverage extended** — the ledger-based ecosystem now participates in the M2 hot-set and identity-axis machinery alongside its existing recon/depth/verification support.
 
 Full release notes: [CHANGELOG.md](CHANGELOG.md). Upgrade guidance: [docs/updating.md](docs/updating.md).
 

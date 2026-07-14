@@ -5,7 +5,7 @@
 ├── CLAUDE.md                          # Orchestrator config — mode table, rules, file refs
 ├── plamen.py                          # Terminal wrapper (Rich + InquirerPy)
 ├── plamen / plamen.sh / plamen.bat    # Launcher scripts (plamen = extensionless, for PATH symlink installs)
-├── VERSION                            # Semantic version (2.2.3)
+├── VERSION                            # Semantic version (2.2.4)
 │
 ├── commands/                          # Claude Code slash commands (4 files)
 │   ├── plamen.md                      # /plamen — full SC audit workflow
@@ -108,6 +108,11 @@
 ├── mcp.json.example                   # MCP server config template
 ├── settings.json.example              # Permissions config template
 ├── requirements.txt                   # Python deps (Rich, InquirerPy)
+├── requirements-dev.txt               # Test-only pinned deps (pytest, pytest-xdist) — layered on requirements.txt, not read by the installer/runtime
+├── pyproject.toml                     # [tool.pytest.ini_options]: unit/integration/slow markers, auto-applied by filename
+├── .github/
+│   └── workflows/
+│       └── tests.yml                  # CI: full pytest suite on push/PR, fast parallel lane + serial integration lane, 3-OS matrix
 ├── .gitmodules                        # Submodule refs
 └── .gitignore
 ```
