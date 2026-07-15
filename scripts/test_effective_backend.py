@@ -210,6 +210,16 @@ def test_run_phase_skeptic_override_codex_available_spawns_codex(tmp_path: Path,
     project.mkdir()
     scratchpad.mkdir()
 
+    # Hermetic: the Codex prompt-builder requires ~/.codex/plamen to exist (a
+    # real Codex install symlink) and raises otherwise. Redirect HOME to a tmp
+    # dir with it created so the test does not depend on the CI runner having a
+    # Codex install — the prompt-build only string-rewrites path references, it
+    # reads nothing from ~/.claude, so an empty dir suffices.
+    fake_home = tmp_path / "home"
+    (fake_home / ".codex" / "plamen").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+
     captured = {}
 
     def fake_codex_exec(*, prompt, phase, config, scratchpad, attempt, label,

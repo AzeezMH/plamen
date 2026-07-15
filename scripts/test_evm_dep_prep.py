@@ -69,6 +69,10 @@ def test_soldeer_install_when_deps_empty(tmp_path, monkeypatch):
 
 def test_npm_ci_when_lockfile_and_node_modules_absent(tmp_path, monkeypatch):
     rp = _rp()
+    # Isolate from the fail-closed supply-chain gate: with a lockfile present but
+    # no offline-scanner binary on PATH (a clean CI runner), the gate aborts by
+    # design. This test targets npm-vs-pnpm selection, not the gate.
+    monkeypatch.setattr(rp, "gate_supply_chain", lambda root: None)
     root = tmp_path / "proj"
     _mk(root / "foundry.toml", "[profile.default]\n")
     _mk(root / "package.json", "{}")
